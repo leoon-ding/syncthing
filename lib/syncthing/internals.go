@@ -33,6 +33,10 @@ func (m *Internals) FolderState(folderID string) (string, time.Time, error) {
 	return m.model.State(folderID)
 }
 
+func (m *Internals) LoadIgnores(folderID string) ([]string, []string, error) {
+	return m.model.LoadIgnores(folderID)
+}
+
 func (m *Internals) Ignores(folderID string) ([]string, []string, error) {
 	return m.model.CurrentIgnores(folderID)
 }

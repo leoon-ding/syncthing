@@ -41,6 +41,7 @@ type MessageHandler func(l LogLevel, msg string)
 
 type Logger interface {
 	AddHandler(level LogLevel, h MessageHandler)
+	SetOutput(w io.Writer)
 	SetFlags(flag int)
 	SetPrefix(prefix string)
 	Debugln(vals ...interface{})
@@ -106,6 +107,10 @@ func (l *logger) AddHandler(level LogLevel, h MessageHandler) {
 	l.mut.Lock()
 	defer l.mut.Unlock()
 	l.handlers[level] = append(l.handlers[level], h)
+}
+
+func (l *logger) SetOutput(w io.Writer) {
+	l.logger.SetOutput(w)
 }
 
 // See log.SetFlags
