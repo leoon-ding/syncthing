@@ -88,3 +88,11 @@ func (m *Internals) DBSnapshot(folderID string) (*db.Snapshot, error) {
 func (m *Internals) ScanFolderSubdirs(folderID string, paths []string) error {
 	return m.model.ScanFolderSubdirs(folderID, paths)
 }
+
+func (m *Internals) RemoteNeedFolderFiles(folderID string, deviceID protocol.DeviceID, page, perpage int) ([]db.FileInfoTruncated, error) {
+	return m.model.RemoteNeedFolderFiles(folderID, deviceID, page, perpage)
+}
+
+func (m *Internals) ScanFolder(folderID string) error {
+	return m.model.ScanFolder(folderID)
+}
