@@ -100,3 +100,7 @@ func (m *Internals) RemoteNeedFolderFiles(folderID string, deviceID protocol.Dev
 func (m *Internals) ScanFolder(folderID string) error {
 	return m.model.ScanFolder(folderID)
 }
+
+func (m *Internals) Override(folderID string) {
+	m.model.Override(folderID)
+}
