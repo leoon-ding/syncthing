@@ -104,3 +104,7 @@ func (m *Internals) ScanFolder(folderID string) error {
 func (m *Internals) Override(folderID string) {
 	m.model.Override(folderID)
 }
+
+func (m *Internals) ResetFolder(folderID string) {
+	m.model.ResetFolder(folderID)
+}
