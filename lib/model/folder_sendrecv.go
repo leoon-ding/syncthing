@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -772,6 +773,14 @@ func (f *sendReceiveFolder) handleSymlink(file protocol.FileInfo, snap *db.Snaps
 	if err = f.inWritableDir(createLink, file.Name); err == nil {
 		dbUpdateChan <- dbUpdateJob{file, dbUpdateHandleSymlink}
 	} else {
+		if os.IsPermission(err) {
+			// We don't have permission to create the symlink. This is not a
+			// problem for us,  so we mark it as unsupported and invalidate it.
+			file.SetUnsupported()
+			l.Debugln(f, "Invalidating symlink (permission)", file.Name)
+			dbUpdateChan <- dbUpdateJob{file, dbUpdateInvalidate}
+			return
+		}
 		f.newPullError(file.Name, fmt.Errorf("symlink create: %w", err))
 	}
 }
