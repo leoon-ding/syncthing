@@ -33,6 +33,10 @@ func (m *Internals) FolderState(folderID string) (string, time.Time, error) {
 	return m.model.State(folderID)
 }
 
+func (m *Internals) LoadIgnores(folderID string) ([]string, []string, error) {
+	return m.model.LoadIgnores(folderID)
+}
+
 func (m *Internals) Ignores(folderID string) ([]string, []string, error) {
 	return m.model.CurrentIgnores(folderID)
 }
@@ -51,6 +55,10 @@ func (m *Internals) BlockAvailability(folderID string, file protocol.FileInfo, b
 
 func (m *Internals) GlobalFileInfo(folderID, path string) (protocol.FileInfo, bool, error) {
 	return m.model.CurrentGlobalFile(folderID, path)
+}
+
+func (m *Internals) LocalFileInfo(folderID, path string) (protocol.FileInfo, bool, error) {
+	return m.model.CurrentFolderFile(folderID, path)
 }
 
 func (m *Internals) GlobalTree(folderID string, prefix string, levels int, returnOnlyDirectories bool) ([]*model.TreeEntry, error) {
@@ -101,4 +109,20 @@ func (m *Internals) RemoteNeedFolderFiles(folder string, device protocol.DeviceI
 
 func (m *Internals) LocalChangedFolderFiles(folder string, page, perpage int) ([]protocol.FileInfo, error) {
 	return m.model.LocalChangedFolderFiles(folder, page, perpage)
+}
+
+func (m *Internals) ScanFolder(folderID string) error {
+	return m.model.ScanFolder(folderID)
+}
+
+func (m *Internals) Override(folderID string) {
+	m.model.Override(folderID)
+}
+
+func (m *Internals) Revert(folderID string) {
+	m.model.Revert(folderID)
+}
+
+func (m *Internals) ResetFolder(folderID string) error {
+	return m.model.ResetFolder(folderID)
 }
