@@ -306,7 +306,7 @@ func NewFilesystem(fsType FilesystemType, uri string, opts ...Option) Filesystem
 func IsInternal(file string) bool {
 	// fs cannot import config or versioner, so we hard code .stfolder
 	// (config.DefaultMarkerName) and .stversions (versioner.DefaultPath)
-	internals := []string{".stfolder", ".stignore", ".stversions"}
+	internals := []string{".stfolder", ".stignore", ".stversions", ".databifrost"}
 	for _, internal := range internals {
 		if file == internal {
 			return true
