@@ -126,3 +126,7 @@ func (m *Internals) Revert(folderID string) {
 func (m *Internals) ResetFolder(folderID string) error {
 	return m.model.ResetFolder(folderID)
 }
+
+func (m *Internals) FolderErrors(folderID string) ([]model.FileError, error) {
+	return m.model.FolderErrors(folderID)
+}
