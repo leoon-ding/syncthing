@@ -137,6 +137,7 @@ func (t *quicListener) serve(ctx context.Context) error {
 
 	acceptFailures := 0
 	const maxAcceptFailures = 10
+	var tempDelay time.Duration // how long to sleep on accept failure
 
 	for {
 		select {
@@ -159,7 +160,16 @@ func (t *quicListener) serve(ctx context.Context) error {
 			}
 
 			// Slightly increased delay for each failure.
-			time.Sleep(time.Duration(acceptFailures) * time.Second)
+			// time.Sleep(time.Duration(acceptFailures) * time.Second)
+			if tempDelay == 0 {
+				tempDelay = 5 * time.Millisecond
+			} else {
+				tempDelay *= 2
+			}
+			if max := 1 * time.Second; tempDelay > max {
+				tempDelay = max
+			}
+			time.Sleep(tempDelay)
 
 			continue
 		}
