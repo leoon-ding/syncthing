@@ -137,7 +137,7 @@ func (t *quicListener) serve(ctx context.Context) error {
 
 	acceptFailures := 0
 	const maxAcceptFailures = 10
-	var tempDelay time.Duration // how long to sleep on accept failure
+	tempDelay := time.Duration(0) // how long to sleep on accept failure
 
 	for {
 		select {
@@ -159,8 +159,7 @@ func (t *quicListener) serve(ctx context.Context) error {
 				return err
 			}
 
-			// Slightly increased delay for each failure.
-			// time.Sleep(time.Duration(acceptFailures) * time.Second)
+			// implement exponential backoff
 			if tempDelay == 0 {
 				tempDelay = 5 * time.Millisecond
 			} else {
@@ -174,6 +173,7 @@ func (t *quicListener) serve(ctx context.Context) error {
 			continue
 		}
 
+		tempDelay = 0
 		acceptFailures = 0
 
 		l.Debugln("connect from", session.RemoteAddr())
