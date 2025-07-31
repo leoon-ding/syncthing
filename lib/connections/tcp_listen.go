@@ -105,7 +105,7 @@ func (t *tcpListener) serve(ctx context.Context) error {
 
 	acceptFailures := 0
 	const maxAcceptFailures = 10
-	var tempDelay time.Duration // how long to sleep on accept failure
+	tempDelay := time.Duration(0) // how long to sleep on accept failure
 
 	// :(, but what can you do.
 	tcpListener := listener.(*net.TCPListener)
@@ -132,8 +132,7 @@ func (t *tcpListener) serve(ctx context.Context) error {
 					return err
 				}
 
-				// // Slightly increased delay for each failure.
-				// time.Sleep(time.Duration(acceptFailures) * time.Second)
+				// implement exponential backoff
 				if tempDelay == 0 {
 					tempDelay = 5 * time.Millisecond
 				} else {
@@ -147,6 +146,7 @@ func (t *tcpListener) serve(ctx context.Context) error {
 			continue
 		}
 
+		tempDelay = 0
 		acceptFailures = 0
 		l.Debugln("Listen (BEP/tcp): connect from", conn.RemoteAddr())
 
