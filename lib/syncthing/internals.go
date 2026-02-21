@@ -9,6 +9,7 @@ package syncthing
 import (
 	"context"
 	"iter"
+	"strings"
 	"time"
 
 	"github.com/syncthing/syncthing/internal/db"
@@ -26,6 +27,13 @@ type Internals struct {
 
 type Counts = db.Counts
 
+// SnapshotCompat provides a compatibility layer for callers previously using
+// the old DB snapshot API from v1.x.
+type SnapshotCompat struct {
+	model  model.Model
+	folder string
+}
+
 func newInternals(model model.Model) *Internals {
 	return &Internals{
 		model: model,
@@ -34,6 +42,10 @@ func newInternals(model model.Model) *Internals {
 
 func (m *Internals) FolderState(folderID string) (string, time.Time, error) {
 	return m.model.State(folderID)
+}
+
+func (m *Internals) LoadIgnores(folderID string) ([]string, []string, error) {
+	return m.model.LoadIgnores(folderID)
 }
 
 func (m *Internals) Ignores(folderID string) ([]string, []string, error) {
@@ -54,6 +66,10 @@ func (m *Internals) BlockAvailability(folderID string, file protocol.FileInfo, b
 
 func (m *Internals) GlobalFileInfo(folderID, path string) (protocol.FileInfo, bool, error) {
 	return m.model.CurrentGlobalFile(folderID, path)
+}
+
+func (m *Internals) LocalFileInfo(folderID, path string) (protocol.FileInfo, bool, error) {
+	return m.model.CurrentFolderFile(folderID, path)
 }
 
 func (m *Internals) GlobalTree(folderID string, prefix string, levels int, returnOnlyDirectories bool) ([]*model.TreeEntry, error) {
@@ -82,6 +98,16 @@ func (m *Internals) PendingFolders(deviceID protocol.DeviceID) (map[string]db.Pe
 
 func (m *Internals) ScanFolderSubdirs(folderID string, paths []string) error {
 	return m.model.ScanFolderSubdirs(folderID, paths)
+}
+
+func (m *Internals) DBSnapshot(folderID string) (*SnapshotCompat, error) {
+	if _, err := m.model.GlobalSize(folderID); err != nil {
+		return nil, err
+	}
+	return &SnapshotCompat{
+		model:  m.model,
+		folder: folderID,
+	}, nil
 }
 
 func (m *Internals) GlobalSize(folder string) (Counts, error) {
@@ -128,4 +154,65 @@ func (m *Internals) RemoteNeedFolderFiles(folder string, device protocol.DeviceI
 
 func (m *Internals) LocalChangedFolderFiles(folder string, page, perpage int) ([]protocol.FileInfo, error) {
 	return m.model.LocalChangedFolderFiles(folder, page, perpage)
+}
+
+func (m *Internals) ScanFolder(folderID string) error {
+	return m.model.ScanFolder(folderID)
+}
+
+func (m *Internals) Override(folderID string) {
+	m.model.Override(folderID)
+}
+
+func (m *Internals) Revert(folderID string) {
+	m.model.Revert(folderID)
+}
+
+func (m *Internals) ResetFolder(folderID string) error {
+	return m.model.ResetFolder(folderID)
+}
+
+func (m *Internals) FolderErrors(folderID string) ([]model.FileError, error) {
+	return m.model.FolderErrors(folderID)
+}
+
+func (s *SnapshotCompat) Release() {}
+
+func (s *SnapshotCompat) WithGlobalTruncated(fn func(protocol.FileInfo) bool) {
+	seq, done := s.model.AllGlobalFiles(s.folder)
+	defer func() {
+		if done != nil {
+			_ = done()
+		}
+	}()
+	for md := range seq {
+		fi, ok, err := s.model.CurrentGlobalFile(s.folder, md.Name)
+		if err != nil || !ok {
+			continue
+		}
+		if !fn(fi) {
+			return
+		}
+	}
+}
+
+func (s *SnapshotCompat) WithPrefixedGlobalTruncated(prefix string, fn func(protocol.FileInfo) bool) {
+	seq, done := s.model.AllGlobalFiles(s.folder)
+	defer func() {
+		if done != nil {
+			_ = done()
+		}
+	}()
+	for md := range seq {
+		if prefix != "" && !strings.HasPrefix(md.Name, prefix) {
+			continue
+		}
+		fi, ok, err := s.model.CurrentGlobalFile(s.folder, md.Name)
+		if err != nil || !ok {
+			continue
+		}
+		if !fn(fi) {
+			return
+		}
+	}
 }

@@ -398,6 +398,9 @@ func (a *App) stopWithErr(stopReason svcutil.ExitStatus, err error) svcutil.Exit
 func (a *App) setupGUI(m model.Model, defaultSub, diskSub events.BufferedSubscription, discoverer discover.Manager, connectionsService connections.Service, urService *ur.Service, errors, systemLog slogutil.Recorder, miscDB *db.Typed) error {
 	guiCfg := a.cfg.GUI()
 
+	summaryService := model.NewFolderSummaryService(a.cfg, m, a.myID, a.evLogger)
+	a.mainService.Add(summaryService)
+
 	if !guiCfg.Enabled {
 		return nil
 	}
@@ -405,9 +408,6 @@ func (a *App) setupGUI(m model.Model, defaultSub, diskSub events.BufferedSubscri
 	if guiCfg.InsecureAdminAccess {
 		slog.Warn("Insecure admin access is enabled")
 	}
-
-	summaryService := model.NewFolderSummaryService(a.cfg, m, a.myID, a.evLogger)
-	a.mainService.Add(summaryService)
 
 	apiSvc := api.New(a.myID, a.cfg, locations.Get(locations.GUIAssets), tlsDefaultCommonName, m, defaultSub, diskSub, a.evLogger, discoverer, connectionsService, urService, summaryService, errors, systemLog, a.opts.NoUpgrade, miscDB)
 	a.mainService.Add(apiSvc)
