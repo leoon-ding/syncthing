@@ -8,9 +8,11 @@ package syncthing
 
 import (
 	"context"
+	"iter"
+	"strings"
 	"time"
 
-	"github.com/syncthing/syncthing/lib/db"
+	"github.com/syncthing/syncthing/internal/db"
 	"github.com/syncthing/syncthing/lib/model"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/stats"
@@ -21,6 +23,15 @@ import (
 // volatile Model interface and upstream users (one of which is an iOS app).
 type Internals struct {
 	model model.Model
+}
+
+type Counts = db.Counts
+
+// SnapshotCompat provides a compatibility layer for callers previously using
+// the old DB snapshot API from v1.x.
+type SnapshotCompat struct {
+	model  model.Model
+	folder string
 }
 
 func newInternals(model model.Model) *Internals {
@@ -46,7 +57,7 @@ func (m *Internals) SetIgnores(folderID string, content []string) error {
 }
 
 func (m *Internals) DownloadBlock(ctx context.Context, deviceID protocol.DeviceID, folderID string, path string, blockNumber int, blockInfo protocol.BlockInfo, allowFromTemporary bool) ([]byte, error) {
-	return m.model.RequestGlobal(ctx, deviceID, folderID, path, int(blockNumber), blockInfo.Offset, blockInfo.Size, blockInfo.Hash, blockInfo.WeakHash, allowFromTemporary)
+	return m.model.RequestGlobal(ctx, deviceID, folderID, path, blockNumber, blockInfo.Offset, blockInfo.Size, blockInfo.Hash, allowFromTemporary)
 }
 
 func (m *Internals) BlockAvailability(folderID string, file protocol.FileInfo, block protocol.BlockInfo) ([]model.Availability, error) {
@@ -85,16 +96,64 @@ func (m *Internals) PendingFolders(deviceID protocol.DeviceID) (map[string]db.Pe
 	return m.model.PendingFolders(deviceID)
 }
 
-func (m *Internals) DBSnapshot(folderID string) (*db.Snapshot, error) {
-	return m.model.DBSnapshot(folderID)
-}
-
 func (m *Internals) ScanFolderSubdirs(folderID string, paths []string) error {
 	return m.model.ScanFolderSubdirs(folderID, paths)
 }
 
-func (m *Internals) RemoteNeedFolderFiles(folderID string, deviceID protocol.DeviceID, page, perpage int) ([]protocol.FileInfo, error) {
-	return m.model.RemoteNeedFolderFiles(folderID, deviceID, page, perpage)
+func (m *Internals) DBSnapshot(folderID string) (*SnapshotCompat, error) {
+	if _, err := m.model.GlobalSize(folderID); err != nil {
+		return nil, err
+	}
+	return &SnapshotCompat{
+		model:  m.model,
+		folder: folderID,
+	}, nil
+}
+
+func (m *Internals) GlobalSize(folder string) (Counts, error) {
+	counts, err := m.model.GlobalSize(folder)
+	if err != nil {
+		return Counts{}, err
+	}
+	return counts, nil
+}
+
+func (m *Internals) LocalSize(folder string) (Counts, error) {
+	counts, err := m.model.LocalSize(folder, protocol.LocalDeviceID)
+	if err != nil {
+		return Counts{}, err
+	}
+	return counts, nil
+}
+
+func (m *Internals) NeedSize(folder string, device protocol.DeviceID) (Counts, error) {
+	counts, err := m.model.NeedSize(folder, device)
+	if err != nil {
+		return Counts{}, err
+	}
+	return counts, nil
+}
+
+func (m *Internals) AllGlobalFiles(folder string) (iter.Seq[db.FileMetadata], func() error) {
+	return m.model.AllGlobalFiles(folder)
+}
+
+func (m *Internals) FolderProgressBytesCompleted(folder string) int64 {
+	return m.model.FolderProgressBytesCompleted(folder)
+}
+
+// NeedFolderFiles returns paginated list of currently needed files in
+// progress, queued, and to be queued on next puller iteration.
+func (m *Internals) NeedFolderFiles(folder string, page, perpage int) ([]protocol.FileInfo, []protocol.FileInfo, []protocol.FileInfo, error) {
+	return m.model.NeedFolderFiles(folder, page, perpage)
+}
+
+func (m *Internals) RemoteNeedFolderFiles(folder string, device protocol.DeviceID, page, perpage int) ([]protocol.FileInfo, error) {
+	return m.model.RemoteNeedFolderFiles(folder, device, page, perpage)
+}
+
+func (m *Internals) LocalChangedFolderFiles(folder string, page, perpage int) ([]protocol.FileInfo, error) {
+	return m.model.LocalChangedFolderFiles(folder, page, perpage)
 }
 
 func (m *Internals) ScanFolder(folderID string) error {
@@ -115,4 +174,45 @@ func (m *Internals) ResetFolder(folderID string) error {
 
 func (m *Internals) FolderErrors(folderID string) ([]model.FileError, error) {
 	return m.model.FolderErrors(folderID)
+}
+
+func (s *SnapshotCompat) Release() {}
+
+func (s *SnapshotCompat) WithGlobalTruncated(fn func(protocol.FileInfo) bool) {
+	seq, done := s.model.AllGlobalFiles(s.folder)
+	defer func() {
+		if done != nil {
+			_ = done()
+		}
+	}()
+	for md := range seq {
+		fi, ok, err := s.model.CurrentGlobalFile(s.folder, md.Name)
+		if err != nil || !ok {
+			continue
+		}
+		if !fn(fi) {
+			return
+		}
+	}
+}
+
+func (s *SnapshotCompat) WithPrefixedGlobalTruncated(prefix string, fn func(protocol.FileInfo) bool) {
+	seq, done := s.model.AllGlobalFiles(s.folder)
+	defer func() {
+		if done != nil {
+			_ = done()
+		}
+	}()
+	for md := range seq {
+		if prefix != "" && !strings.HasPrefix(md.Name, prefix) {
+			continue
+		}
+		fi, ok, err := s.model.CurrentGlobalFile(s.folder, md.Name)
+		if err != nil || !ok {
+			continue
+		}
+		if !fn(fi) {
+			return
+		}
+	}
 }

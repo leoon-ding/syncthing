@@ -41,7 +41,7 @@ func newExternal(cfg config.FolderConfiguration) Versioner {
 
 	s := external{
 		command:    command,
-		filesystem: cfg.Filesystem(nil),
+		filesystem: cfg.Filesystem(),
 	}
 
 	l.Debugf("instantiated %#v", s)
@@ -74,7 +74,7 @@ func (v external) Archive(filePath string) error {
 	}
 
 	context := map[string]string{
-		"%FOLDER_FILESYSTEM%": v.filesystem.Type().String(),
+		"%FOLDER_FILESYSTEM%": string(v.filesystem.Type()),
 		"%FOLDER_PATH%":       v.filesystem.URI(),
 		"%FILE_PATH%":         filePath,
 	}
@@ -101,8 +101,9 @@ func (v external) Archive(filePath string) error {
 	combinedOutput, err := cmd.CombinedOutput()
 	l.Debugln("external command output:", string(combinedOutput))
 	if err != nil {
-		if eerr, ok := err.(*exec.ExitError); ok && len(eerr.Stderr) > 0 {
-			return fmt.Errorf("%v: %v", err, string(eerr.Stderr))
+		eerr := &exec.ExitError{}
+		if errors.As(err, &eerr) && len(eerr.Stderr) > 0 {
+			return fmt.Errorf("%w: %v", err, string(eerr.Stderr))
 		}
 		return err
 	}

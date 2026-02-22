@@ -9,7 +9,7 @@ package versioner
 import (
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -97,7 +97,7 @@ func TestStaggeredVersioningVersionCount(t *testing.T) {
 		"test~20150416-135958", // 365 days 2 seconds ago
 		"test~20150414-140000", // 367 days ago
 	}
-	sort.Strings(delete)
+	slices.Sort(delete)
 
 	cfg := config.FolderConfiguration{
 		FilesystemType: config.FilesystemTypeBasic,
@@ -111,7 +111,7 @@ func TestStaggeredVersioningVersionCount(t *testing.T) {
 
 	v := newStaggered(cfg).(*staggered)
 	rem := v.toRemove(versionsWithMtime, now)
-	sort.Strings(rem)
+	slices.Sort(rem)
 
 	if diff, equal := messagediff.PrettyDiff(delete, rem); !equal {
 		t.Errorf("Incorrect deleted files; got %v, expected %v\n%v", rem, delete, diff)
@@ -139,10 +139,12 @@ func TestCreateVersionPath(t *testing.T) {
 	}
 
 	folderCfg := config.FolderConfiguration{
-		ID:   "default",
-		Path: tmpDir,
+		ID:             "default",
+		FilesystemType: config.FilesystemTypeBasic,
+		Path:           tmpDir,
 		Versioning: config.VersioningConfiguration{
 			Type:   "staggered",
+			FSType: config.FilesystemTypeBasic,
 			FSPath: versionsDir,
 		},
 	}

@@ -13,7 +13,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
-	"log"
+	"log/slog"
 	"os"
 	"path"
 	"runtime"
@@ -24,11 +24,11 @@ import (
 	"github.com/puzpuzpuz/xsync/v3"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/syncthing/syncthing/internal/blob"
 	"github.com/syncthing/syncthing/internal/gen/discosrv"
 	"github.com/syncthing/syncthing/internal/protoutil"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/rand"
-	"github.com/syncthing/syncthing/lib/s3"
 )
 
 type clock interface {
@@ -51,12 +51,12 @@ type inMemoryStore struct {
 	m             *xsync.MapOf[protocol.DeviceID, *discosrv.DatabaseRecord]
 	dir           string
 	flushInterval time.Duration
-	s3            *s3.Session
+	blobs         blob.Store
 	objKey        string
 	clock         clock
 }
 
-func newInMemoryStore(dir string, flushInterval time.Duration, s3sess *s3.Session) *inMemoryStore {
+func newInMemoryStore(dir string, flushInterval time.Duration, blobs blob.Store) *inMemoryStore {
 	hn, err := os.Hostname()
 	if err != nil {
 		hn = rand.String(8)
@@ -65,33 +65,33 @@ func newInMemoryStore(dir string, flushInterval time.Duration, s3sess *s3.Sessio
 		m:             xsync.NewMapOf[protocol.DeviceID, *discosrv.DatabaseRecord](),
 		dir:           dir,
 		flushInterval: flushInterval,
-		s3:            s3sess,
+		blobs:         blobs,
 		objKey:        hn + ".db",
 		clock:         defaultClock{},
 	}
 	nr, err := s.read()
-	if os.IsNotExist(err) && s3sess != nil {
-		// Try to read from AWS
-		latestKey, cerr := s3sess.LatestKey()
+	if os.IsNotExist(err) && blobs != nil {
+		// Try to read from blob storage
+		latestKey, cerr := blobs.LatestKey(context.Background())
 		if cerr != nil {
-			log.Println("Error reading database from S3:", err)
+			slog.Error("Failed to find database in blob storage", "error", cerr)
 			return s
 		}
 		fd, cerr := os.Create(path.Join(s.dir, "records.db"))
 		if cerr != nil {
-			log.Println("Error creating database file:", err)
+			slog.Error("Failed to create database file", "error", cerr)
 			return s
 		}
-		if cerr := s3sess.Download(fd, latestKey); cerr != nil {
-			log.Printf("Error reading database from S3: %v", err)
+		if cerr := blobs.Download(context.Background(), latestKey, fd); cerr != nil {
+			slog.Error("Failed to download database from blob storage", "error", cerr)
 		}
 		_ = fd.Close()
 		nr, err = s.read()
 	}
 	if err != nil {
-		log.Println("Error reading database:", err)
+		slog.Error("Failed to read database", "error", err)
 	}
-	log.Printf("Read %d records from database", nr)
+	slog.Info("Loaded database", "records", nr)
 	s.expireAndCalculateStatistics()
 	return s
 }
@@ -153,13 +153,13 @@ loop:
 	for {
 		select {
 		case <-t.C:
-			log.Println("Calculating statistics")
+			slog.InfoContext(ctx, "Calculating statistics")
 			s.expireAndCalculateStatistics()
-			log.Println("Flushing database")
+			slog.InfoContext(ctx, "Flushing database")
 			if err := s.write(); err != nil {
-				log.Println("Error writing database:", err)
+				slog.ErrorContext(ctx, "Failed to write database", "error", err)
 			}
-			log.Println("Finished flushing database")
+			slog.InfoContext(ctx, "Finished flushing database")
 			t.Reset(s.flushInterval)
 
 		case <-ctx.Done():
@@ -256,7 +256,7 @@ func (s *inMemoryStore) write() (err error) {
 	if err != nil {
 		return err
 	}
-	bw := bufio.NewWriter(fd)
+	bw := bufio.NewWriterSize(fd, 1<<20)
 
 	var buf []byte
 	var rangeErr error
@@ -310,18 +310,24 @@ func (s *inMemoryStore) write() (err error) {
 		return err
 	}
 
-	// Upload to S3
-	if s.s3 != nil {
+	if info, err := os.Lstat(dbf); err == nil {
+		slog.Info("Saved database", "name", dbf, "size", info.Size(), "modtime", info.ModTime())
+	} else {
+		slog.Warn("Failed to stat database after save", "error", err)
+	}
+
+	// Upload to blob storage
+	if s.blobs != nil {
 		fd, err = os.Open(dbf)
 		if err != nil {
-			log.Printf("Error uploading database to S3: %v", err)
+			slog.Error("Failed to upload database to blob storage", "error", err)
 			return nil
 		}
 		defer fd.Close()
-		if err := s.s3.Upload(fd, s.objKey); err != nil {
-			log.Printf("Error uploading database to S3: %v", err)
+		if err := s.blobs.Upload(context.Background(), s.objKey, fd); err != nil {
+			slog.Error("Failed to upload database to blob storage", "error", err)
 		}
-		log.Println("Finished uploading database")
+		slog.Info("Finished uploading database")
 	}
 
 	return nil
@@ -360,7 +366,7 @@ func (s *inMemoryStore) read() (int, error) {
 			key, err = protocol.DeviceIDFromString(string(rec.Key))
 		}
 		if err != nil {
-			log.Println("Bad device ID:", err)
+			slog.Error("Got bad device ID while reading database", "error", err)
 			continue
 		}
 

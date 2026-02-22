@@ -9,7 +9,8 @@ package config
 import (
 	"encoding/json"
 	"encoding/xml"
-	"sort"
+	"slices"
+	"strings"
 
 	"github.com/syncthing/syncthing/lib/structutil"
 )
@@ -20,7 +21,7 @@ type VersioningConfiguration struct {
 	Params           map[string]string `json:"params" xml:"parameter" protobuf_key:"bytes,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
 	CleanupIntervalS int               `json:"cleanupIntervalS" xml:"cleanupIntervalS" default:"3600"`
 	FSPath           string            `json:"fsPath" xml:"fsPath"`
-	FSType           FilesystemType    `json:"fsType" xml:"fsType"`
+	FSType           FilesystemType    `json:"fsType" xml:"fsType" default:"basic"`
 }
 
 func (c *VersioningConfiguration) Reset() {
@@ -33,7 +34,7 @@ type internalVersioningConfiguration struct {
 	Params           []internalParam `xml:"param"`
 	CleanupIntervalS int             `xml:"cleanupIntervalS" default:"3600"`
 	FSPath           string          `xml:"fsPath"`
-	FSType           FilesystemType  `xml:"fsType"`
+	FSType           FilesystemType  `xml:"fsType" default:"basic"`
 }
 
 type internalParam struct {
@@ -84,8 +85,8 @@ func (c *VersioningConfiguration) toInternal() internalVersioningConfiguration {
 	for k, v := range c.Params {
 		tmp.Params = append(tmp.Params, internalParam{k, v})
 	}
-	sort.Slice(tmp.Params, func(a, b int) bool {
-		return tmp.Params[a].Key < tmp.Params[b].Key
+	slices.SortFunc(tmp.Params, func(a, b internalParam) int {
+		return strings.Compare(a.Key, b.Key)
 	})
 	return tmp
 }
