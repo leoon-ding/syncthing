@@ -72,6 +72,15 @@ func (m *Internals) LocalFileInfo(folderID, path string) (protocol.FileInfo, boo
 	return m.model.CurrentFolderFile(folderID, path)
 }
 
+func (m *Internals) LocalFileInfos(folderID string) ([]protocol.FileInfo, error) {
+	it, errFn := m.model.LocalFiles(folderID, protocol.LocalDeviceID)
+	infos := make([]protocol.FileInfo, 0)
+	for info := range it {
+		infos = append(infos, info)
+	}
+	return infos, errFn()
+}
+
 func (m *Internals) GlobalTree(folderID string, prefix string, levels int, returnOnlyDirectories bool) ([]*model.TreeEntry, error) {
 	return m.model.GlobalDirectoryTree(folderID, prefix, levels, returnOnlyDirectories)
 }
