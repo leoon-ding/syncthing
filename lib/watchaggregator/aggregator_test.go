@@ -33,6 +33,30 @@ func TestMain(m *testing.M) {
 	os.Exit(ret)
 }
 
+func TestAggregatorStringConcurrentConfigurationUpdate(t *testing.T) {
+	folderCfg := defaultFolderCfg.Copy()
+	folderCfg.ID = "string-race"
+	a := newAggregator(context.Background(), folderCfg)
+
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		for range 1000 {
+			_ = a.String()
+		}
+	}()
+	for i := range 1000 {
+		updated := folderCfg.Copy()
+		updated.Label = strconv.Itoa(i)
+		a.updateConfig(updated)
+	}
+	<-readDone
+
+	if got, want := a.String(), `aggregator/"999" (string-race):`; got != want {
+		t.Fatalf("String() = %q, want %q", got, want)
+	}
+}
+
 const (
 	testNotifyDelayS   = 1
 	testNotifyTimeout  = 2 * time.Second

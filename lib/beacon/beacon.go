@@ -82,6 +82,9 @@ func (c *cast) String() string {
 }
 
 func (c *cast) Send(data []byte) {
+	// The writer consumes inbox entries asynchronously, so retain ownership of
+	// the queued bytes even if the caller reuses its buffer after Send returns.
+	data = append([]byte(nil), data...)
 	select {
 	case c.inbox <- data:
 	case <-c.stopped:
