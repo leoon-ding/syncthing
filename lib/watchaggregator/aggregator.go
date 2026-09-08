@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/syncthing/syncthing/lib/config"
@@ -93,8 +94,9 @@ func (dir *eventDir) eventType() fs.EventType {
 
 type aggregator struct {
 	// folderID never changes and is accessed in CommitConfiguration, which
-	// asynchronously updates folderCfg -> can't use folderCfg.ID (racy)
+	// asynchronously updates folderCfg -> can't use folderCfg.ID without locking.
 	folderID        string
+	folderCfgMut    sync.RWMutex
 	folderCfg       config.FolderConfiguration
 	folderCfgUpdate chan config.FolderConfiguration
 	// Time after which an event is scheduled for scanning when no modifications occur.
@@ -418,7 +420,10 @@ func (a *aggregator) isOld(ev *aggregatedEvent, currTime time.Time, delayRem boo
 }
 
 func (a *aggregator) String() string {
-	return fmt.Sprintf("aggregator/%s:", a.folderCfg.Description())
+	a.folderCfgMut.RLock()
+	description := a.folderCfg.Description()
+	a.folderCfgMut.RUnlock()
+	return fmt.Sprintf("aggregator/%s:", description)
 }
 
 func (a *aggregator) CommitConfiguration(_, to config.Configuration) bool {
@@ -445,7 +450,9 @@ func (a *aggregator) updateConfig(folderCfg config.FolderConfiguration) {
 		// Use the default FSWatcherTimeoutS calculation
 		a.notifyTimeout = notifyTimeout(folderCfg.FSWatcherDelayS)
 	}
+	a.folderCfgMut.Lock()
 	a.folderCfg = folderCfg
+	a.folderCfgMut.Unlock()
 }
 
 func updateInProgressSet(event events.Event, inProgress map[string]struct{}) {
