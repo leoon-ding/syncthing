@@ -580,3 +580,61 @@ func getRawConnection(c Connection) *rawConnection {
 	}
 	return raw
 }
+
+func TestCloseBeforeStart(t *testing.T) {
+	m := newTestModel()
+	rw := testutil.NewBlockingRW()
+	c := getRawConnection(NewConnection(c0ID, rw, rw, testutil.NoopCloser{}, m, new(mockedConnectionInfo), CompressionNever, testKeyGen))
+	defer closeAndWait(c, rw)
+	done := make(chan struct{})
+	go func() { c.Close(errManual); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Close waited for an unstarted writer")
+	}
+	select {
+	case <-m.closedCh:
+	case <-time.After(time.Second):
+		t.Fatal("cleanup did not notify model")
+	}
+	c.Start()
+	select {
+	case <-c.started:
+		t.Fatal("closed connection started")
+	default:
+	}
+	c.Close(errManual)
+	if m.closedErr != errManual {
+		t.Fatalf("close error = %v", m.closedErr)
+	}
+}
+
+func TestConcurrentStartAndClose(t *testing.T) {
+	for range 50 {
+		m := newTestModel()
+		rw := testutil.NewBlockingRW()
+		c := getRawConnection(NewConnection(c0ID, rw, rw, rw, m, new(mockedConnectionInfo), CompressionNever, testKeyGen))
+		ready := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); <-ready; c.Start() }()
+		go func() { defer wg.Done(); <-ready; c.Close(errManual) }()
+		close(ready)
+		// Release I/O and complete cleanup for either ordering.
+		rw.Close()
+		done := make(chan struct{})
+		go func() { wg.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("Start/Close deadlocked")
+		}
+		c.loopWG.Wait()
+		select {
+		case <-m.closedCh:
+		case <-time.After(time.Second):
+			t.Fatal("missing close callback")
+		}
+	}
+}
