@@ -185,6 +185,7 @@ type rawConnection struct {
 	sendCloseOnce         sync.Once
 	compression           Compression
 	startStopMut          sync.Mutex // start and stop must be serialized
+	closing               bool       // protected by startStopMut; seals admission to Start
 
 	loopWG sync.WaitGroup // Need to ensure no leftover routines in testing
 }
@@ -268,6 +269,10 @@ func newRawConnection(deviceID DeviceID, reader io.Reader, writer io.Writer, clo
 func (c *rawConnection) Start() {
 	c.startStopMut.Lock()
 	defer c.startStopMut.Unlock()
+
+	if c.closing {
+		return
+	}
 
 	select {
 	case <-c.started:
@@ -935,8 +940,25 @@ func (c *rawConnection) shouldCompressMessage(msg proto.Message) bool {
 // argument specifies the reason for closing the connection.
 func (c *rawConnection) Close(err error) {
 	c.sendCloseOnce.Do(func() {
+		select {
+		case <-c.started:
+			// Started connections keep the existing callback-safe close path.
+		default:
+			c.startStopMut.Lock()
+			select {
+			case <-c.started:
+				c.startStopMut.Unlock()
+			default:
+				// No writer can receive a close message. Seal Start before
+				// releasing the lock, then use the normal cleanup path.
+				c.closing = true
+				c.startStopMut.Unlock()
+				return
+			}
+		}
 		done := make(chan struct{})
 		timeout := time.NewTimer(CloseTimeout)
+		defer timeout.Stop()
 		select {
 		case c.closeBox <- asyncMessage{&bep.Close{Reason: err.Error()}, done}:
 			select {

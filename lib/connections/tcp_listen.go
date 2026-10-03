@@ -177,7 +177,13 @@ func (t *tcpListener) serve(ctx context.Context) error {
 		if isLocal {
 			priority = t.cfg.Options().ConnectionPriorityTCPLAN
 		}
-		t.conns <- newInternalConn(tc, connTypeTCPServer, isLocal, priority)
+		select {
+		case t.conns <- newInternalConn(tc, connTypeTCPServer, isLocal, priority):
+		case <-ctx.Done():
+			// Ownership remains with the listener until the connection is accepted.
+			_ = tc.Close()
+			return nil
+		}
 	}
 }
 

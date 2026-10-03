@@ -983,6 +983,7 @@ jobs:
 
   docker-ghcr:
     name: Build and push Docker images (GHCR)
+    if: github.repository_owner == 'syncthing'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -1142,7 +1143,7 @@ jobs:
       - name: run govulncheck
         run: |
           go run build.go assets
-          go install golang.org/x/vuln/cmd/govulncheck@latest
+          go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
           govulncheck ./...
 
   #
