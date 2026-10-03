@@ -13,6 +13,8 @@ import (
 	"io"
 	"net"
 	"net/url"
+	"runtime"
+	"syscall"
 	"testing"
 	"time"
 
@@ -132,7 +134,10 @@ func TestTCPListenerConnectionHandoff(t *testing.T) {
 					t.Fatal("handoff ignored cancellation")
 				}
 				_ = client.SetReadDeadline(time.Now().Add(time.Second))
-				if _, err := client.Read(make([]byte, 1)); err != io.EOF {
+				_, err := client.Read(make([]byte, 1))
+				// Windows may report WSAECONNRESET instead of EOF when the peer closes.
+				reset := runtime.GOOS == "windows" && errors.Is(err, syscall.Errno(10054))
+				if !errors.Is(err, io.EOF) && !reset {
 					t.Fatalf("unclaimed connection not closed: %v", err)
 				}
 			}
