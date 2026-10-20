@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/syncthing/syncthing/internal/db"
+	"github.com/syncthing/syncthing/lib/connections"
 	"github.com/syncthing/syncthing/lib/model"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/stats"
@@ -22,7 +23,8 @@ import (
 // the package, it is not intended as a stable API at this time. It does however provide a boundary between the more
 // volatile Model interface and upstream users (one of which is an iOS app).
 type Internals struct {
-	model model.Model
+	model       model.Model
+	connections connections.Service
 }
 
 type Counts = db.Counts
@@ -224,4 +226,13 @@ func (s *SnapshotCompat) WithPrefixedGlobalTruncated(prefix string, fn func(prot
 			return
 		}
 	}
+}
+
+// ConnectionAddresses snapshots the actual listeners, including discovered NAT
+// mappings. It never edits or persists configured device addresses.
+func (m *Internals) ConnectionAddresses() []string {
+	if m.connections == nil {
+		return nil
+	}
+	return m.connections.AllAddresses()
 }

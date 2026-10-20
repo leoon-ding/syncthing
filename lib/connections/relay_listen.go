@@ -21,6 +21,7 @@ import (
 	"github.com/syncthing/syncthing/lib/dialer"
 	"github.com/syncthing/syncthing/lib/nat"
 	"github.com/syncthing/syncthing/lib/relay/client"
+	relayprotocol "github.com/syncthing/syncthing/lib/relay/protocol"
 	"github.com/syncthing/syncthing/lib/svcutil"
 )
 
@@ -32,6 +33,7 @@ func init() {
 }
 
 type relayListener struct {
+	privateClient client.RelayClient
 	svcutil.ServiceWithError
 	onAddressesChangedNotifier
 
@@ -46,7 +48,11 @@ type relayListener struct {
 }
 
 func (t *relayListener) serve(ctx context.Context) error {
-	clnt, err := client.NewClient(t.uri, t.tlsCfg.Certificates, 10*time.Second)
+	clnt := t.privateClient
+	var err error
+	if clnt == nil {
+		clnt, err = client.NewClient(t.uri, t.tlsCfg.Certificates, 10*time.Second)
+	}
 	if err != nil {
 		slog.WarnContext(ctx, "Failed to listen (relay)", slogutil.Error(err))
 		return err
@@ -61,8 +67,9 @@ func (t *relayListener) serve(ctx context.Context) error {
 	defer t.clearAddresses(t)
 
 	invitationCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	go t.handleInvitations(invitationCtx, clnt)
+	done := make(chan struct{})
+	defer func() { cancel(); <-done }()
+	go func() { defer close(done); t.handleInvitations(invitationCtx, clnt) }()
 
 	return clnt.Serve(ctx)
 }
@@ -101,14 +108,21 @@ func (t *relayListener) handleInvitations(ctx context.Context, clnt client.Relay
 				tc = tls.Client(conn, t.tlsCfg)
 			}
 
-			err = tlsTimedHandshake(tc)
+			handshakeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			err = tc.HandshakeContext(handshakeCtx)
+			cancel()
 			if err != nil {
 				tc.Close()
 				slog.WarnContext(ctx, "Failed TLS handshake", slogutil.Error(err))
 				continue
 			}
 
-			t.conns <- newInternalConn(tc, connTypeRelayServer, false, t.cfg.Options().ConnectionPriorityRelay)
+			select {
+			case t.conns <- newInternalConn(tc, connTypeRelayServer, false, t.cfg.Options().ConnectionPriorityRelay):
+			case <-ctx.Done():
+				tc.Close()
+				return
+			}
 
 		// Poor mans notifier that informs the connection service that the
 		// relay URI has changed. This can only happen when we connect to a
@@ -145,6 +159,11 @@ func (t *relayListener) WANAddresses() []*url.URL {
 		return nil
 	}
 
+	if t.privateClient != nil {
+		snapshot := *curi
+		snapshot.Scheme = "private-relay"
+		curi = &snapshot
+	}
 	return []*url.URL{curi}
 }
 
@@ -196,4 +215,56 @@ func (relayListenerFactory) Valid(cfg config.Configuration) error {
 		return errDisabled
 	}
 	return nil
+}
+
+// servePrivateRelay borrows one embedding run while preserving the native
+// listener/session implementation. No endpoint is added to persisted config.
+func (s *service) servePrivateRelay(ctx context.Context) error {
+	backoff := time.Second
+	for ctx.Err() == nil {
+		scope, uri, token, release, err := s.options.PrivateRelay(ctx)
+		if err == nil && scope != nil && uri != nil {
+			run, cancel := context.WithCancel(ctx)
+			stop := context.AfterFunc(scope, cancel)
+			first := true
+			cl, e := client.NewPrivateClient(uri, s.tlsCfg.Certificates, 10*time.Second, func(call context.Context) (relayprotocol.PermitToken, error) {
+				if first {
+					first = false
+					return token, nil
+				}
+				return s.options.PrivateRenew(call, uri)
+			})
+			if e == nil {
+				listener := &relayListener{uri: uri, cfg: s.cfg, tlsCfg: s.tlsCfg, conns: s.conns, privateClient: cl}
+				s.listenersMut.Lock()
+				s.privateRelay = listener
+				s.listenersMut.Unlock()
+				_ = listener.serve(run)
+				s.listenersMut.Lock()
+				if s.privateRelay == listener {
+					s.privateRelay = nil
+				}
+				s.listenersMut.Unlock()
+			}
+			stop()
+			cancel()
+		}
+		if release != nil {
+			release()
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+		if backoff < time.Minute {
+			backoff *= 2
+			if backoff > time.Minute {
+				backoff = time.Minute
+			}
+		}
+	}
+	return ctx.Err()
 }

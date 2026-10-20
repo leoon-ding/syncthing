@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -36,8 +37,10 @@ import (
 )
 
 var (
-	listen string
-	debug  bool
+	privateConfigPath string
+	controlledRelay   *privateRelay
+	listen            string
+	debug             bool
 
 	sessionAddress []byte
 	sessionPort    uint16
@@ -81,6 +84,7 @@ func main() {
 
 	var dir, extAddress, proto string
 
+	flag.StringVar(&privateConfigPath, "private-config", "", "Operator JSON issuer and Ed25519 public keys; enables permission-only relay")
 	flag.StringVar(&listen, "listen", ":22067", "Protocol listen address")
 	flag.StringVar(&dir, "keys", ".", "Directory where cert.pem and key.pem is stored")
 	flag.DurationVar(&networkTimeout, "network-timeout", networkTimeout, "Timeout for network operations between the client and the relay.\n\tIf no data is received between the client and the relay in this period of time, the connection is terminated.\n\tFurthermore, if no data is sent between either clients being relayed within this period of time, the session is also terminated.")
@@ -182,6 +186,27 @@ func main() {
 	}
 
 	id := syncthingprotocol.NewDeviceID(cert.Certificate[0])
+	if privateConfigPath != "" {
+		if natEnabled || token != "" {
+			log.Fatal("private relay forbids automatic router mapping and shared tokens")
+		}
+		raw, e := os.ReadFile(privateConfigPath)
+		if e != nil || len(raw) > 8192 {
+			log.Fatal("private relay configuration unavailable")
+		}
+		var c privateRelayConfig
+		if json.Unmarshal(raw, &c) != nil {
+			log.Fatal("invalid private relay configuration")
+		}
+		controlledRelay, e = newPrivateRelay(c, id)
+		if e != nil {
+			log.Fatal("invalid private relay configuration")
+		}
+		tlsCfg.NextProtos = []string{protocol.ControlledProtocolName}
+		poolAddrs = ""
+		log.Printf("Private relay boot: %s", controlledRelay.boot)
+	}
+
 	if debug {
 		log.Println("ID:", id)
 	}

@@ -38,6 +38,7 @@ import (
 	"github.com/syncthing/syncthing/lib/nat"
 	"github.com/syncthing/syncthing/lib/osutil"
 	"github.com/syncthing/syncthing/lib/protocol"
+	relayprotocol "github.com/syncthing/syncthing/lib/relay/protocol"
 	"github.com/syncthing/syncthing/lib/semaphore"
 	"github.com/syncthing/syncthing/lib/sliceutil"
 	"github.com/syncthing/syncthing/lib/stringutil"
@@ -126,6 +127,24 @@ var tlsVersionNames = map[uint16]string{
 
 // Service listens and dials all configured unconnected devices, via supported
 // dialers. Successful connections are handed to the model.
+// Options contains optional embedding hooks. Zero values preserve standalone
+// behavior. STUNServers is read concurrently and must return an owned snapshot.
+// It controls STUN only; NATEnabled continues to control router port mapping.
+type Options struct {
+	PrivateRelay   func(context.Context) (context.Context, *url.URL, relayprotocol.PermitToken, func(), error)
+	PrivateRenew   func(context.Context, *url.URL) (relayprotocol.PermitToken, error)
+	PrivateConnect func(context.Context, protocol.DeviceID, *url.URL) (relayprotocol.PermitToken, error)
+	STUNServers    func() []string
+	// Lookup supplies non-persistent hints in addition to existing discovery.
+	Lookup func(context.Context, protocol.DeviceID) ([]string, error)
+	// BeforeDial reserves an attempt. The returned release is called after the
+	// dial and identity check finish, including every failure path.
+	BeforeDial func(context.Context, protocol.DeviceID, string, bool) (context.Context, func(), error)
+	// Admit registers authenticated connection work before it becomes visible
+	// to the model. Its context cancels the connection; release follows Closed.
+	Admit func(context.Context, protocol.DeviceID, *x509.Certificate, bool) (context.Context, func(), error)
+}
+
 type Service interface {
 	suture.Service
 	discover.AddressLister
@@ -173,17 +192,23 @@ type service struct {
 	registry             *registry.Registry
 	keyGen               *protocol.KeyGenerator
 	lanChecker           *lanChecker
+	options              Options
 
 	dialNow           chan struct{}
 	dialNowDevices    map[protocol.DeviceID]struct{}
 	dialNowDevicesMut sync.Mutex
 
+	privateRelay   *relayListener
 	listenersMut   sync.RWMutex
 	listeners      map[string]genericListener
 	listenerTokens map[string]suture.ServiceToken
 }
 
-func NewService(cfg config.Wrapper, myID protocol.DeviceID, mdl Model, tlsCfg *tls.Config, discoverer discover.Finder, bepProtocolName string, tlsDefaultCommonName string, evLogger events.Logger, registry *registry.Registry, keyGen *protocol.KeyGenerator) Service {
+func NewService(cfg config.Wrapper, myID protocol.DeviceID, mdl Model, tlsCfg *tls.Config, discoverer discover.Finder, bepProtocolName string, tlsDefaultCommonName string, evLogger events.Logger, registry *registry.Registry, keyGen *protocol.KeyGenerator, options ...Options) Service {
+	var opts Options
+	if len(options) > 0 {
+		opts = options[0]
+	}
 	spec := svcutil.SpecWithInfoLogger()
 	service := &service{
 		Supervisor:              suture.New("connections.Service", spec),
@@ -203,7 +228,8 @@ func NewService(cfg config.Wrapper, myID protocol.DeviceID, mdl Model, tlsCfg *t
 		evLogger:             evLogger,
 		registry:             registry,
 		keyGen:               keyGen,
-		lanChecker:           &lanChecker{cfg},
+		lanChecker:           &lanChecker{cfg: cfg, stunServers: opts.STUNServers, privateConnect: opts.PrivateConnect},
+		options:              opts,
 
 		dialNow:        make(chan struct{}, 1),
 		dialNowDevices: make(map[protocol.DeviceID]struct{}),
@@ -229,6 +255,9 @@ func NewService(cfg config.Wrapper, myID protocol.DeviceID, mdl Model, tlsCfg *t
 	service.Add(svcutil.AsService(service.handleConns, fmt.Sprintf("%s/handleConns", service)))
 	service.Add(svcutil.AsService(service.handleHellos, fmt.Sprintf("%s/handleHellos", service)))
 	service.Add(service.natService)
+	if opts.PrivateRelay != nil && opts.PrivateRenew != nil {
+		service.Add(svcutil.AsService(service.servePrivateRelay, "private native relay"))
+	}
 
 	svcutil.OnSupervisorDone(service.Supervisor, func() {
 		service.cfg.Unsubscribe(service.limiter)
@@ -420,15 +449,37 @@ func (s *service) handleHellos(ctx context.Context) error {
 			continue
 		}
 
+		admissionCtx := ctx
+		release := func() {}
+		if s.options.Admit != nil {
+			scope, done, err := s.options.Admit(ctx, remoteID, remoteCert, c.IsLocal())
+			if done != nil {
+				release = done
+			}
+			if err != nil || scope == nil {
+				c.Close()
+				release()
+				continue
+			}
+			admissionCtx = scope
+		}
+		if admissionCtx.Err() != nil {
+			c.Close()
+			release()
+			continue
+		}
 		// Wrap the connection in rate limiters. The limiter itself will
 		// keep up with config changes to the rate and whether or not LAN
 		// connections are limited.
 		rd, wr := s.limiter.getLimiters(remoteID, c, c.IsLocal())
 
 		protoConn := protocol.NewConnection(remoteID, rd, wr, c, s.model, c, deviceCfg.Compression.ToProtocol(), s.keyGen)
+		stopAdmission := context.AfterFunc(admissionCtx, func() { protoConn.Close(context.Canceled) })
 		s.accountAddedConnection(protoConn, hello, s.cfg.Options().ConnectionPriorityUpgradeThreshold)
 		go func() {
 			<-protoConn.Closed()
+			stopAdmission()
+			release()
 			s.accountRemovedConnection(protoConn)
 			s.dialNowDevicesMut.Lock()
 			s.dialNowDevices[remoteID] = struct{}{}
@@ -723,11 +774,18 @@ func (s *service) resolveDeviceAddrs(ctx context.Context, cfg config.DeviceConfi
 			addrs = append(addrs, addr)
 		}
 	}
+	if s.options.Lookup != nil {
+		if hints, err := s.options.Lookup(ctx, cfg.DeviceID); err == nil {
+			addrs = append(addrs, hints...)
+		}
+	}
 	return stringutil.UniqueTrimmedStrings(addrs)
 }
 
 type lanChecker struct {
-	cfg config.Wrapper
+	cfg            config.Wrapper
+	stunServers    func() []string
+	privateConnect func(context.Context, protocol.DeviceID, *url.URL) (relayprotocol.PermitToken, error)
 }
 
 func (s *lanChecker) isLANHost(host string) bool {
@@ -939,6 +997,11 @@ func (s *service) AllAddresses() []string {
 			addrs = append(addrs, wanAddr.String())
 		}
 	}
+	if s.privateRelay != nil {
+		for _, address := range s.privateRelay.WANAddresses() {
+			addrs = append(addrs, address.String())
+		}
+	}
 	s.listenersMut.RUnlock()
 	return stringutil.UniqueTrimmedStrings(addrs)
 }
@@ -952,6 +1015,11 @@ func (s *service) ExternalAddresses() []string {
 	for _, listener := range s.listeners {
 		for _, wanAddr := range listener.WANAddresses() {
 			addrs = append(addrs, wanAddr.String())
+		}
+	}
+	if s.privateRelay != nil {
+		for _, address := range s.privateRelay.WANAddresses() {
+			addrs = append(addrs, address.String())
 		}
 	}
 	s.listenersMut.RUnlock()
@@ -1095,6 +1163,41 @@ func IsAllowedNetwork(host string, allowed []string) bool {
 	return false
 }
 
+func (s *service) dialWithAdmission(ctx context.Context, target dialTarget) (internalConn, error) {
+	if s.options.BeforeDial != nil {
+		local := false
+		if uri, e := url.Parse(target.addr); e == nil && s.lanChecker != nil && uri.Hostname() != "" && (strings.HasPrefix(uri.Scheme, "tcp") || strings.HasPrefix(uri.Scheme, "quic")) {
+			local = s.lanChecker.isLANHost(uri.Hostname())
+		}
+		scope, release, err := s.options.BeforeDial(ctx, target.deviceID, target.addr, local)
+		if release != nil {
+			defer release()
+		}
+		if err != nil {
+			return internalConn{}, err
+		}
+		if scope == nil {
+			return internalConn{}, errors.New("missing dial admission context")
+		}
+		ctx = scope
+	}
+	if err := ctx.Err(); err != nil {
+		return internalConn{}, err
+	}
+	conn, err := target.Dial(ctx)
+	if err != nil {
+		return conn, err
+	}
+	if err := s.validateIdentity(conn, target.deviceID); err != nil {
+		return internalConn{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		conn.Close()
+		return internalConn{}, err
+	}
+	return conn, nil
+}
+
 func (s *service) dialParallel(ctx context.Context, deviceID protocol.DeviceID, dialTargets []dialTarget, parentSema *semaphore.Semaphore) (internalConn, bool) {
 	// Group targets into buckets by priority
 	dialTargetBuckets := make(map[int][]dialTarget, len(dialTargets))
@@ -1124,11 +1227,7 @@ func (s *service) dialParallel(ctx context.Context, deviceID protocol.DeviceID, 
 					wg.Done()
 					sema.Give(1)
 				}()
-				conn, err := tgt.Dial(ctx)
-				if err == nil {
-					// Closes the connection on error
-					err = s.validateIdentity(conn, deviceID)
-				}
+				conn, err := s.dialWithAdmission(ctx, tgt)
 				s.setConnectionStatus(tgt.addr, err)
 				if err != nil {
 					l.Debugln("dialing", deviceID, tgt.uri, "error:", err)

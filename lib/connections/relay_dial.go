@@ -9,6 +9,8 @@ package connections
 import (
 	"context"
 	"crypto/tls"
+	"errors"
+	relayprotocol "github.com/syncthing/syncthing/lib/relay/protocol"
 	"net/url"
 	"time"
 
@@ -21,14 +23,31 @@ import (
 
 func init() {
 	dialers["relay"] = relayDialerFactory{}
+	dialers["private-relay"] = privateRelayDialerFactory{}
 }
 
 type relayDialer struct {
 	commonDialer
+	privateConnect func(context.Context, protocol.DeviceID, *url.URL) (relayprotocol.PermitToken, error)
 }
 
 func (d *relayDialer) Dial(ctx context.Context, id protocol.DeviceID, uri *url.URL) (internalConn, error) {
-	inv, err := client.GetInvitationFromRelay(ctx, uri, id, d.tlsCfg.Certificates, 10*time.Second)
+	var inv relayprotocol.SessionInvitation
+	var err error
+	if uri.Scheme == "private-relay" {
+		if d.privateConnect == nil {
+			return internalConn{}, errors.New("private relay unavailable")
+		}
+		token, e := d.privateConnect(ctx, id, uri)
+		if e != nil {
+			return internalConn{}, e
+		}
+		target := *uri
+		target.Scheme = "relay"
+		inv, err = client.GetPrivateInvitationFromRelay(ctx, &target, d.tlsCfg.Certificates, token, 10*time.Second)
+	} else {
+		inv, err = client.GetInvitationFromRelay(ctx, uri, id, d.tlsCfg.Certificates, 10*time.Second)
+	}
 	if err != nil {
 		return internalConn{}, err
 	}
@@ -56,7 +75,9 @@ func (d *relayDialer) Dial(ctx context.Context, id protocol.DeviceID, uri *url.U
 		tc = tls.Client(conn, d.tlsCfg)
 	}
 
-	err = tlsTimedHandshake(tc)
+	handshakeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	err = tc.HandshakeContext(handshakeCtx)
+	cancel()
 	if err != nil {
 		tc.Close()
 		return internalConn{}, err
@@ -72,7 +93,7 @@ func (d *relayDialer) Priority(_ string) int {
 type relayDialerFactory struct{}
 
 func (relayDialerFactory) New(opts config.OptionsConfiguration, tlsCfg *tls.Config, _ *registry.Registry, _ *lanChecker) genericDialer {
-	return &relayDialer{commonDialer{
+	return &relayDialer{commonDialer: commonDialer{
 		trafficClass:      opts.TrafficClass,
 		reconnectInterval: time.Duration(opts.RelayReconnectIntervalM) * time.Minute,
 		tlsCfg:            tlsCfg,
@@ -94,4 +115,17 @@ func (relayDialerFactory) Valid(cfg config.Configuration) error {
 
 func (relayDialerFactory) String() string {
 	return "Relay Dialer"
+}
+
+type privateRelayDialerFactory struct{ relayDialerFactory }
+
+func (privateRelayDialerFactory) Valid(config.Configuration) error { return nil }
+func (privateRelayDialerFactory) New(opts config.OptionsConfiguration, tlsCfg *tls.Config, registry *registry.Registry, checker *lanChecker) genericDialer {
+	d := relayDialerFactory{}.New(opts, tlsCfg, registry, checker).(*relayDialer)
+	// Short grants must not inherit the public relay reconnect delay in minutes.
+	d.reconnectInterval = 30 * time.Second
+	if checker != nil {
+		d.privateConnect = checker.privateConnect
+	}
+	return d
 }

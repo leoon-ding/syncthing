@@ -53,6 +53,7 @@ type Service struct {
 	cfg        config.Wrapper
 	subscriber Subscriber
 	client     *stun.Client
+	policy     func() []string
 
 	natType NATType
 	addr    *Host
@@ -83,6 +84,35 @@ func New(cfg config.Wrapper, subscriber Subscriber, conn net.PacketConn) *Servic
 	return s
 }
 
+// SetServerPolicy installs an embedding application's run-local STUN policy.
+// It must be called before Serve. Nil preserves standalone configuration; a
+// non-nil callback returns only explicit endpoints, with no public fallback.
+// An empty list disables STUN independently of router port mapping.
+func (s *Service) SetServerPolicy(policy func() []string) { s.policy = policy }
+
+func (s *Service) disabled() bool {
+	opts := s.cfg.Options()
+	if s.policy != nil {
+		return opts.StunKeepaliveMinS < 1 || opts.StunKeepaliveStartS < 1 || len(s.policy()) == 0
+	}
+	return opts.IsStunDisabled()
+}
+
+func (s *Service) servers() []string {
+	if s.policy == nil {
+		return s.cfg.Options().StunServers()
+	}
+	var out []string
+	for _, addr := range s.policy() {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil || host == "" || port == "" {
+			continue
+		}
+		out = append(out, addr)
+	}
+	return out
+}
+
 func (s *Service) Serve(ctx context.Context) error {
 	defer func() {
 		s.setNATType(NATUnknown)
@@ -90,6 +120,7 @@ func (s *Service) Serve(ctx context.Context) error {
 	}()
 
 	timer := time.NewTimer(time.Millisecond)
+	defer timer.Stop()
 
 	for {
 	disabled:
@@ -99,14 +130,14 @@ func (s *Service) Serve(ctx context.Context) error {
 		case <-timer.C:
 		}
 
-		if s.cfg.Options().IsStunDisabled() {
+		if s.disabled() {
 			timer.Reset(time.Second)
 			continue
 		}
 
 		l.Debugf("Starting stun for %s", s)
 
-		for _, addr := range s.cfg.Options().StunServers() {
+		for _, addr := range s.servers() {
 			// This blocks until we hit an exit condition or there are
 			// issues with the STUN server.
 			if err := s.runStunForServer(ctx, addr); errors.Is(err, errNotPunchable) {
@@ -121,10 +152,11 @@ func (s *Service) Serve(ctx context.Context) error {
 			}
 
 			// Are we disabled?
-			if s.cfg.Options().IsStunDisabled() {
+			if s.disabled() {
 				slog.InfoContext(ctx, "STUN disabled")
 				s.setNATType(NATUnknown)
 				s.setExternalAddress(nil, "")
+				timer.Reset(time.Second)
 				goto disabled
 			}
 		}
@@ -231,7 +263,7 @@ func (s *Service) stunKeepAlive(ctx context.Context, addr string, extAddr *Host)
 			return ctx.Err()
 		}
 
-		if s.cfg.Options().IsStunDisabled() {
+		if s.disabled() {
 			// Disabled, give up
 			l.Debugf("%s disabled, aborting stun ", s)
 			return errors.New("disabled")

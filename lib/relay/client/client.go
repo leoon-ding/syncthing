@@ -36,6 +36,19 @@ func NewClient(uri *url.URL, certs []tls.Certificate, timeout time.Duration) (Re
 	}
 }
 
+// NewPrivateClient registers only with a pinned, explicitly configured relay.
+// permit must return a fresh, bounded Join permit; tokens never enter the URI.
+func NewPrivateClient(uri *url.URL, certs []tls.Certificate, timeout time.Duration, permit func(context.Context) (protocol.PermitToken, error)) (RelayClient, error) {
+	if uri == nil || uri.Scheme != "relay" || uri.Query().Get("id") == "" || uri.Query().Get("token") != "" || permit == nil {
+		return nil, protocol.ErrPermit
+	}
+	snapshot := *uri
+	c := newStaticClient(&snapshot, certs, make(chan protocol.SessionInvitation), timeout)
+	c.permit = permit
+	c.config.NextProtos = []string{protocol.ControlledProtocolName}
+	return c, nil
+}
+
 type commonClient struct {
 	svcutil.ServiceWithError
 
