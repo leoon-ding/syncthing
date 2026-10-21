@@ -254,6 +254,53 @@ func BenchmarkRequestInSingleFile(b *testing.B) {
 	b.SetBytes(128 << 10)
 }
 
+// BenchmarkRequestInFolderAdmission isolates the real folder fence cost from
+// network and disk-cache variance. Both paths read and verify identical blocks;
+// every response is closed before the next request, including the final borrow.
+func BenchmarkRequestInFolderAdmission(b *testing.B) {
+	for _, enabled := range []bool{false, true} {
+		name := "legacy"
+		if enabled {
+			name = "admitted"
+		}
+		b.Run(name, func(b *testing.B) {
+			w, cancel := newConfigWrapper(defaultCfg)
+			defer cancel()
+			var gate *FolderAccess
+			if enabled {
+				gate = new(FolderAccess)
+			}
+			m := setupModel(b, w, gate)
+			defer cleanupModel(m)
+			ffs := w.FolderList()[0].Filesystem()
+			data := make([]byte, 128<<10)
+			srand.Read(data)
+			writeFile(b, ffs, "admission-performance.bin", data)
+			b.SetBytes(int64(len(data)))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				response, err := m.Request(device1Conn, &protocol.Request{Folder: "default", Name: "admission-performance.bin", Size: len(data)})
+				if err != nil {
+					b.Fatal(err)
+				}
+				valid := bytes.Equal(response.Data(), data)
+				response.Close()
+				if !valid {
+					b.Fatal("request content mismatch")
+				}
+			}
+			b.StopTimer()
+			gate.Seal(device1, "default")
+			ctx, cancelDrain := context.WithTimeout(context.Background(), time.Second)
+			defer cancelDrain()
+			if err := gate.Drain(ctx, device1, "default"); err != nil {
+				b.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestDeviceRename(t *testing.T) {
 	hello := protocol.Hello{
 		ClientName:    "syncthing",
@@ -4125,10 +4172,9 @@ func TestAddConnectionRejectsCompletedQuiesce(t *testing.T) {
 
 func TestRequestAdmissionPrecedesSnapshotAndFolderRecreation(t *testing.T) {
 	cfg, folder := newDefaultCfgWrapper(t)
-	m := setupModel(t, cfg)
-	defer cleanupModel(m)
 	gate := new(FolderAccess)
-	m.folderAccess = gate
+	m := setupModel(t, cfg, gate)
+	defer cleanupModel(m)
 	file, err := folder.Filesystem().Create("private.txt")
 	if err != nil {
 		t.Fatal(err)
@@ -4230,4 +4276,107 @@ func TestRequestAdmissionPrecedesSnapshotAndFolderRecreation(t *testing.T) {
 		t.Fatal("unexpected file contents")
 	}
 	response.Close()
+}
+
+func TestIndexAcrossAsymmetricPrimaryConnections(t *testing.T) {
+	cfg, _ := newDefaultCfgWrapper(t)
+	m := setupModel(t, cfg)
+	defer cleanupModel(m)
+	incoming := newFakeConnection(device1, m)
+	outgoing := newFakeConnection(device1, m)
+	m.AddConnection(incoming, protocol.Hello{})
+	m.AddConnection(outgoing, protocol.Hello{})
+	// Our ClusterConfig selects incoming for remote indexes; the peer selects
+	// outgoing for our indexes. Both belong to the same authenticated device.
+	if err := m.ClusterConfig(outgoing, &protocol.ClusterConfig{Folders: []protocol.Folder{{ID: "default", Devices: []protocol.Device{{ID: myID}, {ID: device1}}}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Index(incoming, &protocol.Index{Folder: "default"}); err != nil {
+		t.Fatal("index on locally selected primary", err)
+	}
+	stale := newFakeConnection(device1, m)
+	if err := m.Index(stale, &protocol.Index{Folder: "default"}); err == nil {
+		t.Fatal("unregistered connection accepted")
+	}
+	outgoing.Close(errors.New("remote primary closed"))
+	m.mut.RLock()
+	_, retained := m.indexHandlers.Get(device1)
+	m.mut.RUnlock()
+	if retained {
+		t.Fatal("closed remote primary retained index handler")
+	}
+}
+
+func TestClusterConfigFenceDoesNotWithdrawAdvertisedFolder(t *testing.T) {
+	cfg, _ := newDefaultCfgWrapper(t)
+	m := setupModel(t, cfg, new(FolderAccess))
+	defer cleanupModel(m)
+	conn := newFakeConnection(device1, m)
+	m.AddConnection(conn, protocol.Hello{})
+	cc := &protocol.ClusterConfig{Folders: []protocol.Folder{{ID: "default", Devices: []protocol.Device{{ID: myID}, {ID: device1}}}}}
+	if err := m.ClusterConfig(conn, cc); err != nil {
+		t.Fatal(err)
+	}
+	m.folderAccess.Seal(device1, "default")
+	w, err := cfg.Modify(func(c *config.Configuration) { c.Folders[0].Paused = true })
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Wait()
+	if err := m.ClusterConfig(conn, cc); err != nil {
+		t.Fatal(err)
+	}
+	m.mut.RLock()
+	remoteState := m.remoteFolderStates[device1]["default"]
+	m.mut.RUnlock()
+	if remoteState != remoteFolderValid {
+		t.Fatal("local fence changed remote visibility", remoteState)
+	}
+	w, err = cfg.Modify(func(c *config.Configuration) { c.Folders[0].Paused = false })
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Wait()
+	if err := m.folderAccess.Open(device1, "default"); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Index(conn, &protocol.Index{Folder: "default"}); err != nil {
+		t.Fatal("resume lost advertised folder", err)
+	}
+	// A real withdrawal must still remove the handler, even while fenced.
+	m.folderAccess.Seal(device1, "default")
+	if err := m.ClusterConfig(conn, &protocol.ClusterConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.folderAccess.Open(device1, "default"); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Index(conn, &protocol.Index{Folder: "default"}); err == nil {
+		t.Fatal("withdrawn folder retained")
+	}
+}
+
+func TestFolderReopenRegeneratesClusterConfig(t *testing.T) {
+	cfg, _ := newDefaultCfgWrapper(t)
+	gate := new(FolderAccess)
+	m := setupModel(t, cfg, gate)
+	defer cleanupModel(m)
+	conn := newFakeConnection(device1, m)
+	notices := make(chan *protocol.ClusterConfig, 4)
+	conn.ClusterConfigCalls(func(cc *protocol.ClusterConfig, _ map[string]string) { notices <- cc })
+	m.AddConnection(conn, protocol.Hello{})
+	m.promoteConnections()
+	<-notices
+	gate.Seal(device1, "default")
+	if err := gate.Open(device1, "default"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case cc := <-notices:
+		if len(cc.Folders) != 1 || cc.Folders[0].ID != "default" {
+			t.Fatalf("fresh complete advertisement: %+v", cc)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("model did not regenerate advertisement")
+	}
 }

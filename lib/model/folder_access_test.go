@@ -73,9 +73,8 @@ func TestFolderAccessSealDrainIsolationAndRecovery(t *testing.T) {
 }
 func TestFolderAccessRequestRetainedUntilResponseClose(t *testing.T) {
 	cfg, folder := newDefaultCfgWrapper(t)
-	m := setupModel(t, cfg)
+	m := setupModel(t, cfg, new(FolderAccess))
 	defer cleanupModel(m)
-	m.folderAccess = new(FolderAccess)
 	file, err := folder.Filesystem().Create("native.txt")
 	if err != nil {
 		t.Fatal(err)
@@ -192,5 +191,86 @@ func TestFolderAccessIndexRechecksAfterLock(t *testing.T) {
 	h := &indexHandler{conn: device1Conn, cond: sync.NewCond(cancelIndexLock{cancel})}
 	if err := h.receive(nil, false, "index", 0, 0, ctx); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestFolderAccessReopenRequestsFreshAdvertisement(t *testing.T) {
+	g := new(FolderAccess)
+	events := g.Reopened()
+	g.Seal(device1, "one")
+	if err := g.Open(device1, "one"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-events:
+	default:
+		t.Fatal("reopen did not request refresh")
+	}
+	if err := g.Open(device1, "one"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-events:
+		t.Fatal("no-op open refreshed")
+	default:
+	}
+	g.Seal(device1, "one")
+	g.Seal(device1, "two")
+	if err := g.Open(device1, "one"); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Open(device1, "two"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-events:
+	default:
+		t.Fatal("missing coalesced refresh")
+	}
+	select {
+	case <-events:
+		t.Fatal("unbounded refresh queue")
+	default:
+	}
+}
+
+func TestPausedAnnouncementPreservesRevocationFence(t *testing.T) {
+	g := new(FolderAccess)
+	ctx := context.Background()
+	old, release, err := g.AdmitAnnouncement(ctx, device1, "a", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.Seal(protocol.EmptyDeviceID, "a")
+	if old.Err() == nil {
+		t.Fatal("old snapshot not canceled")
+	}
+	release()
+	if err := g.CommitPause(protocol.EmptyDeviceID, "a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := g.Admit(ctx, device1, "a"); err == nil {
+		t.Fatal("paused data admitted")
+	}
+	if _, _, err := g.AdmitAnnouncement(ctx, device1, "a", false); err == nil {
+		t.Fatal("old unpaused snapshot admitted")
+	}
+	paused, release, err := g.AdmitAnnouncement(ctx, device1, "a", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.Seal(device1, "a")
+	if paused.Err() == nil {
+		t.Fatal("revocation did not cancel paused snapshot")
+	}
+	release()
+	if _, _, err := g.AdmitAnnouncement(ctx, device1, "a", true); err == nil {
+		t.Fatal("revoked pause admitted")
+	}
+	if err := g.Open(protocol.EmptyDeviceID, "a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := g.AdmitAnnouncement(ctx, device1, "a", true); err == nil {
+		t.Fatal("broader pause open bypassed peer fence")
 	}
 }

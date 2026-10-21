@@ -814,3 +814,105 @@ func TestFolderIndexCancellationDoesNotWaitForOtherFolderWrite(t *testing.T) {
 		}
 	}
 }
+
+func TestClusterConfigFenceRejectsWholeSnapshotAndReleases(t *testing.T) {
+	c := newRawConnection(c0ID, bytes.NewReader(nil), io.Discard, testutil.NoopCloser{}, nil, new(mockedConnectionInfo), CompressionNever)
+	releases := 0
+	c.folderAdmit = func(ctx context.Context, folder string) (context.Context, func(), error) {
+		if folder == "closed" {
+			return nil, nil, context.Canceled
+		}
+		return ctx, func() { releases++ }, nil
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.ClusterConfig(&ClusterConfig{Folders: []Folder{{ID: "open"}, {ID: "closed"}}}, nil)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("partial snapshot queued")
+	}
+	if releases != 1 {
+		t.Fatal("earlier borrow leaked", releases)
+	}
+}
+
+func TestCanceledFirstClusterConfigWaitsForFreshSnapshot(t *testing.T) {
+	var output bytes.Buffer
+	c := newRawConnection(c0ID, bytes.NewReader(nil), &output, testutil.NoopCloser{}, nil, new(mockedConnectionInfo), CompressionNever)
+	c.outbox = make(chan asyncMessage, 1)
+	pingDone := make(chan struct{})
+	c.outbox <- asyncMessage{msg: &bep.Ping{}, done: pingDone}
+	exited := make(chan struct{})
+	go func() { defer close(exited); c.writerLoop() }()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	staleDone := make(chan struct{})
+	c.clusterConfigBox <- clusterConfigMessage{config: &ClusterConfig{Folders: []Folder{{ID: "stale"}}}, scopes: []context.Context{ctx}, done: staleDone}
+	<-staleDone
+	freshDone := make(chan struct{})
+	c.clusterConfigBox <- clusterConfigMessage{config: &ClusterConfig{Folders: []Folder{{ID: "fresh"}}}, done: freshDone}
+	<-freshDone
+	<-pingDone
+	close(c.closed)
+	<-exited
+	reader := newRawConnection(c1ID, bytes.NewReader(output.Bytes()), io.Discard, testutil.NoopCloser{}, nil, new(mockedConnectionInfo), CompressionNever)
+	msg, err := reader.readMessage(make([]byte, 4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cc, ok := msg.(*bep.ClusterConfig)
+	if !ok || len(cc.Folders) != 1 || cc.Folders[0].Id != "fresh" {
+		t.Fatalf("first wire message: %v", msg)
+	}
+	msg, err = reader.readMessage(make([]byte, 4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := msg.(*bep.Ping); !ok {
+		t.Fatalf("control after fresh config: %v", msg)
+	}
+}
+
+func TestPausedFolderAllowsSiblingUpdateAndReconnect(t *testing.T) {
+	for _, reconnect := range []bool{false, true} {
+		t.Run(fmt.Sprint(reconnect), func(t *testing.T) {
+			var output bytes.Buffer
+			c := newRawConnection(c0ID, bytes.NewReader(nil), &output, testutil.NoopCloser{}, nil, new(mockedConnectionInfo), CompressionNever)
+			c.folderAdmit = func(context.Context, string) (context.Context, func(), error) {
+				t.Error("announcement used data admission")
+				return nil, nil, context.Canceled
+			}
+			c.announcementAdmit = func(ctx context.Context, id string, paused bool) (context.Context, func(), error) {
+				if id == "a" && !paused {
+					return nil, nil, context.Canceled
+				}
+				return ctx, func() {}, nil
+			}
+			exited := make(chan struct{})
+			go func() { defer close(exited); c.writerLoop() }()
+			if !reconnect {
+				c.ClusterConfig(&ClusterConfig{}, nil)
+			}
+			c.ClusterConfig(&ClusterConfig{Folders: []Folder{{ID: "a", StopReason: FolderStopReasonPaused}, {ID: "b", Label: "updated"}}}, nil)
+			close(c.closed)
+			<-exited
+			reader := newRawConnection(c1ID, bytes.NewReader(output.Bytes()), io.Discard, testutil.NoopCloser{}, nil, new(mockedConnectionInfo), CompressionNever)
+			if !reconnect {
+				if _, err := reader.readMessage(make([]byte, 4)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			msg, err := reader.readMessage(make([]byte, 4))
+			if err != nil {
+				t.Fatal(err)
+			}
+			cc, ok := msg.(*bep.ClusterConfig)
+			if !ok || len(cc.Folders) != 2 || cc.Folders[1].Label != "updated" {
+				t.Fatalf("incomplete config: %v", msg)
+			}
+		})
+	}
+}

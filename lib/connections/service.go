@@ -131,11 +131,19 @@ var tlsVersionNames = map[uint16]string{
 // behavior. STUNServers is read concurrently and must return an owned snapshot.
 // It controls STUN only; NATEnabled continues to control router port mapping.
 type Options struct {
-	FolderAdmit    func(context.Context, protocol.DeviceID, string) (context.Context, func(), error)
-	PrivateRelay   func(context.Context) (context.Context, *url.URL, relayprotocol.PermitToken, func(), error)
-	PrivateRenew   func(context.Context, *url.URL) (relayprotocol.PermitToken, error)
-	PrivateConnect func(context.Context, protocol.DeviceID, *url.URL) (relayprotocol.PermitToken, error)
-	STUNServers    func() []string
+	// SingleWANConnection reserves the embedding run's second per-peer slot for
+	// path upgrades. LAN connections and hosts without this hook keep the
+	// configured multi-connection policy; no persisted configuration changes.
+	// The hook is read concurrently by dialing and inbound handshakes.
+	SingleWANConnection func() bool
+	// FolderAnnouncementAdmit receives the advertised pause flag. Nil retains
+	// the FolderAdmit fallback for hosts without separate metadata admission.
+	FolderAnnouncementAdmit func(context.Context, protocol.DeviceID, string, bool) (context.Context, func(), error)
+	FolderAdmit             func(context.Context, protocol.DeviceID, string) (context.Context, func(), error)
+	PrivateRelay            func(context.Context) (context.Context, *url.URL, relayprotocol.PermitToken, func(), error)
+	PrivateRenew            func(context.Context, *url.URL) (relayprotocol.PermitToken, error)
+	PrivateConnect          func(context.Context, protocol.DeviceID, *url.URL) (relayprotocol.PermitToken, error)
+	STUNServers             func() []string
 	// Lookup supplies non-persistent hints in addition to existing discovery.
 	Lookup func(context.Context, protocol.DeviceID) ([]string, error)
 	// BeforeDial reserves an attempt. The returned release is called after the
@@ -323,7 +331,7 @@ func (s *service) handleConns(ctx context.Context) error {
 		_ = c.SetDeadline(time.Now().Add(20 * time.Second))
 		go func() {
 			// Exchange Hello messages with the peer.
-			outgoing := s.helloForDevice(remoteID)
+			outgoing := s.helloForDevice(remoteID, c.IsLocal())
 			incoming, err := protocol.ExchangeHello(c, outgoing)
 			// The timestamps are used to create the connection ID.
 			c.connectionID = newConnectionID(outgoing.Timestamp, incoming.Timestamp)
@@ -336,7 +344,7 @@ func (s *service) handleConns(ctx context.Context) error {
 	}
 }
 
-func (s *service) helloForDevice(remoteID protocol.DeviceID) protocol.Hello {
+func (s *service) helloForDevice(remoteID protocol.DeviceID, local bool) protocol.Hello {
 	hello := protocol.Hello{
 		ClientName:    "syncthing",
 		ClientVersion: build.Version,
@@ -344,6 +352,9 @@ func (s *service) helloForDevice(remoteID protocol.DeviceID) protocol.Hello {
 	}
 	if cfg, ok := s.cfg.Device(remoteID); ok {
 		hello.NumConnections = cfg.NumConnections()
+		if !local && s.singleWANConnection() {
+			hello.NumConnections = 1
+		}
 		// Set our name (from the config of our device ID) only if we
 		// already know about the other side device ID.
 		if myCfg, ok := s.cfg.Device(s.myID); ok {
@@ -380,6 +391,9 @@ func (s *service) connectionCheckEarly(remoteID protocol.DeviceID, c internalCon
 
 	currentConns := s.numConnectionsForDevice(cfg.DeviceID)
 	desiredConns := s.desiredConnectionsToDevice(cfg.DeviceID)
+	if !c.IsLocal() && s.singleWANConnection() {
+		desiredConns = 1
+	}
 	worstPrio := s.worstConnectionPriority(remoteID)
 	ourUpgradeThreshold := c.priority + s.cfg.Options().ConnectionPriorityUpgradeThreshold
 	if currentConns >= desiredConns && ourUpgradeThreshold >= worstPrio {
@@ -456,6 +470,15 @@ func (s *service) handleHellos(ctx context.Context) error {
 			continue
 		}
 
+		// Hellos complete concurrently. Recheck at the serialized attachment
+		// boundary so simultaneous equal-priority dials cannot occupy the spare
+		// upgrade slot after both passed the pre-Hello check.
+		if !c.IsLocal() && s.singleWANConnection() {
+			if err := s.connectionCheckEarly(remoteID, c); err != nil {
+				c.Close()
+				continue
+			}
+		}
 		admissionCtx := ctx
 		release := func() {}
 		if s.options.Admit != nil {
@@ -486,7 +509,13 @@ func (s *service) handleHellos(ctx context.Context) error {
 				return s.options.FolderAdmit(ctx, remoteID, folder)
 			}
 		}
-		protoConn := protocol.NewConnection(remoteID, rd, wr, c, s.model, c, deviceCfg.Compression.ToProtocol(), s.keyGen, folderAdmit)
+		var announce func(context.Context, string, bool) (context.Context, func(), error)
+		if s.options.FolderAnnouncementAdmit != nil {
+			announce = func(ctx context.Context, folder string, paused bool) (context.Context, func(), error) {
+				return s.options.FolderAnnouncementAdmit(ctx, remoteID, folder, paused)
+			}
+		}
+		protoConn := protocol.NewConnectionWithAnnouncement(remoteID, rd, wr, c, s.model, c, deviceCfg.Compression.ToProtocol(), s.keyGen, announce, folderAdmit)
 		stopAdmission := context.AfterFunc(admissionCtx, func() { protoConn.Close(context.Canceled) })
 		s.admissionMu.Lock()
 		if s.quiescing {
@@ -1414,11 +1443,30 @@ func (r nextDialRegistry) sleepDurationAndCleanup(now time.Time) time.Duration {
 	return sleep
 }
 
+func (s *service) singleWANConnection() bool {
+	return s.options.SingleWANConnection != nil && s.options.SingleWANConnection()
+}
+
 func (s *service) desiredConnectionsToDevice(deviceID protocol.DeviceID) int {
 	cfg, ok := s.cfg.Device(deviceID)
 	if !ok {
 		// We want no connections to an unknown device.
 		return 0
+	}
+
+	if s.singleWANConnection() {
+		s.connectionsMut.Lock()
+		wan := false
+		for _, conn := range s.connections[deviceID] {
+			if !conn.IsLocal() {
+				wan = true
+				break
+			}
+		}
+		s.connectionsMut.Unlock()
+		if wan {
+			return 1
+		}
 	}
 
 	otherSide := s.wantConnectionsForDevice(deviceID)

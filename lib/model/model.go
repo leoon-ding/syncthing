@@ -290,6 +290,14 @@ func (m *model) serve(ctx context.Context) error {
 		case err := <-m.fatalChan:
 			l.Debugln(m, "fatal error, stopping", err)
 			return svcutil.AsFatalErr(err, svcutil.ExitError)
+		case <-m.folderAccess.Reopened():
+			ids := make([]protocol.DeviceID, 0)
+			m.mut.RLock()
+			for id := range m.deviceConnIDs {
+				ids = append(ids, id)
+			}
+			m.mut.RUnlock()
+			m.sendClusterConfig(ids)
 		case <-m.promotionTimer.C:
 			slog.Debug("Promotion timer fired")
 			m.promoteConnections()
@@ -1218,18 +1226,22 @@ type ClusterConfigReceivedEventData struct {
 func (m *model) ClusterConfig(conn protocol.Connection, cm *protocol.ClusterConfig) error {
 	deviceID := conn.DeviceID()
 	scopes := make(map[string]context.Context)
+	withheld := make(map[string]struct{})
 	if m.folderAccess != nil {
 		snapshot := *cm
 		snapshot.Folders = nil
 		for _, folder := range cm.Folders {
 			scope, release, err := m.folderAccess.Admit(context.Background(), conn.DeviceID(), folder.ID)
 			if err != nil {
+				withheld[folder.ID] = struct{}{}
 				continue
 			}
 			defer release()
 			scopes[folder.ID] = scope
 			if scope.Err() == nil {
 				snapshot.Folders = append(snapshot.Folders, folder)
+			} else {
+				withheld[folder.ID] = struct{}{}
 			}
 		}
 		cm = &snapshot
@@ -1328,16 +1340,25 @@ func (m *model) ClusterConfig(conn protocol.Connection, cm *protocol.ClusterConf
 		for _, folder := range cm.Folders {
 			if scopes[folder.ID].Err() == nil {
 				folders = append(folders, folder)
+			} else {
+				withheld[folder.ID] = struct{}{}
 			}
 		}
 		cm.Folders = folders
 	}
-	tempIndexFolders, states, err := m.ccHandleFolders(cm.Folders, deviceCfg, ccDeviceInfos, indexHandlerRegistry)
+	tempIndexFolders, states, err := m.ccHandleFolders(cm.Folders, deviceCfg, ccDeviceInfos, indexHandlerRegistry, withheld)
 	if err != nil {
 		return err
 	}
 
 	m.mut.Lock()
+	for id := range withheld {
+		if previous, ok := m.remoteFolderStates[deviceID][id]; ok {
+			states[id] = previous
+		} else {
+			delete(states, id)
+		}
+	}
 	m.remoteFolderStates[deviceID] = states
 	m.mut.Unlock()
 
@@ -1428,11 +1449,16 @@ func (m *model) getIndexHandlerRLocked(conn protocol.Connection) (*indexHandlerR
 		return indexHandlerRegistry, true
 	}
 
-	// There is no index handler, or it's not registered for this connection.
+	// Each side independently selects the connection on which it requests
+	// indexes. The registry sends on the peer's choice, while received indexes
+	// may arrive on our primary. Never accept an unregistered/stale connection.
+	if ids := m.deviceConnIDs[deviceID]; ok && len(ids) > 0 && ids[0] == connID {
+		return indexHandlerRegistry, true
+	}
 	return nil, false
 }
 
-func (m *model) ccHandleFolders(folders []protocol.Folder, deviceCfg config.DeviceConfiguration, ccDeviceInfos map[string]*clusterConfigDeviceInfo, indexHandlers *indexHandlerRegistry) ([]string, map[string]remoteFolderState, error) {
+func (m *model) ccHandleFolders(folders []protocol.Folder, deviceCfg config.DeviceConfiguration, ccDeviceInfos map[string]*clusterConfigDeviceInfo, indexHandlers *indexHandlerRegistry, withheld map[string]struct{}) ([]string, map[string]remoteFolderState, error) {
 	var folderDevice config.FolderDeviceConfiguration
 	tempIndexFolders := make([]string, 0, len(folders))
 	seenFolders := make(map[string]remoteFolderState, len(folders))
@@ -1535,7 +1561,17 @@ func (m *model) ccHandleFolders(folders []protocol.Folder, deviceCfg config.Devi
 		indexHandlers.AddIndexInfo(folder.ID, ccDeviceInfos[folder.ID])
 	}
 
-	indexHandlers.RemoveAllExcept(seenFolders)
+	// A locally fenced advertisement is not a remote withdrawal. Retain
+	// existing metadata only; never create a handler or authorize data from it.
+	// Configuration removal and the per-request fence still revoke access.
+	retained := make(map[string]remoteFolderState, len(seenFolders)+len(withheld))
+	for id, state := range seenFolders {
+		retained[id] = state
+	}
+	for id := range withheld {
+		retained[id] = remoteFolderUnknown
+	}
+	indexHandlers.RemoveAllExcept(retained)
 
 	// Explicitly mark folders we offer, but the remote has not accepted
 	for folderID, cfg := range m.cfg.Folders() {
@@ -1931,11 +1967,13 @@ func (m *model) Closed(conn protocol.Connection, err error) {
 	removedIsPrimary := m.promotedConnID[deviceID] == connID
 	remainingConns := without(m.deviceConnIDs[deviceID], connID)
 	var wait <-chan error
+	// The peer's index-sending connection need not be our primary. Drain its
+	// registry whenever its owning connection closes, including a secondary.
+	if idxh, ok := m.indexHandlers.Get(deviceID); ok && idxh.conn.ConnectionID() == connID {
+		wait = m.indexHandlers.RemoveAndWaitChan(deviceID, 0)
+	}
 	if removedIsPrimary {
 		m.progressEmitter.temporaryIndexUnsubscribe(conn)
-		if idxh, ok := m.indexHandlers.Get(deviceID); ok && idxh.conn.ConnectionID() == connID {
-			wait = m.indexHandlers.RemoveAndWaitChan(deviceID, 0)
-		}
 		m.scheduleConnectionPromotion()
 	}
 	if len(remainingConns) == 0 {

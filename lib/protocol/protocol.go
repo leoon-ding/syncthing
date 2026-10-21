@@ -157,7 +157,8 @@ type ConnectionInfo interface {
 }
 
 type rawConnection struct {
-	folderAdmit func(context.Context, string) (context.Context, func(), error)
+	folderAdmit       func(context.Context, string) (context.Context, func(), error)
+	announcementAdmit func(context.Context, string, bool) (context.Context, func(), error)
 	ConnectionInfo
 
 	deviceID  DeviceID
@@ -217,6 +218,16 @@ const (
 var CloseTimeout = 10 * time.Second
 
 func NewConnection(deviceID DeviceID, reader io.Reader, writer io.Writer, closer io.Closer, model Model, connInfo ConnectionInfo, compress Compression, keyGen *KeyGenerator, admission ...func(context.Context, string) (context.Context, func(), error)) Connection {
+	return newConnection(deviceID, reader, writer, closer, model, connInfo, compress, keyGen, nil, admission...)
+}
+
+// NewConnectionWithAnnouncement separates configuration metadata admission from
+// data admission. Both callbacks must retain revocation scopes until send completes.
+func NewConnectionWithAnnouncement(deviceID DeviceID, reader io.Reader, writer io.Writer, closer io.Closer, model Model, connInfo ConnectionInfo, compress Compression, keyGen *KeyGenerator, announce func(context.Context, string, bool) (context.Context, func(), error), admission func(context.Context, string) (context.Context, func(), error)) Connection {
+	return newConnection(deviceID, reader, writer, closer, model, connInfo, compress, keyGen, announce, admission)
+}
+
+func newConnection(deviceID DeviceID, reader io.Reader, writer io.Writer, closer io.Closer, model Model, connInfo ConnectionInfo, compress Compression, keyGen *KeyGenerator, announce func(context.Context, string, bool) (context.Context, func(), error), admission ...func(context.Context, string) (context.Context, func(), error)) Connection {
 	// We create the wrapper for the model first, as it needs to be passed
 	// in at the lowest level in the stack. At the end of construction,
 	// before returning, we add the connection to cwm so that it can be used
@@ -234,6 +245,7 @@ func NewConnection(deviceID DeviceID, reader io.Reader, writer io.Writer, closer
 	if len(admission) > 0 {
 		rc.folderAdmit = admission[0]
 	}
+	rc.announcementAdmit = announce
 	ec := newEncryptedConnection(rc, rc, em.folderKeys, keyGen)
 	wc := wireFormatConnection{ec}
 
@@ -469,44 +481,50 @@ func (c *rawConnection) ClusterConfig(config *ClusterConfig, _ map[string]string
 	snapshot := *config
 	snapshot.Folders = nil
 	message := clusterConfigMessage{config: &snapshot, done: make(chan struct{})}
-	if c.folderAdmit == nil {
+	defer func() {
+		for _, release := range message.releases {
+			release()
+		}
+	}()
+	if c.folderAdmit == nil && c.announcementAdmit == nil {
 		snapshot.Folders = config.Folders
 	} else {
 		for _, folder := range config.Folders {
-			scope, release, err := c.folderAdmit(context.Background(), folder.ID)
+			var scope context.Context
+			var release func()
+			var err error
+			if c.announcementAdmit != nil {
+				scope, release, err = c.announcementAdmit(context.Background(), folder.ID, folder.StopReason == FolderStopReasonPaused)
+			} else {
+				scope, release, err = c.folderAdmit(context.Background(), folder.ID)
+			}
 			if err != nil {
-				continue
+				return
 			}
 			snapshot.Folders = append(snapshot.Folders, folder)
 			message.scopes = append(message.scopes, scope)
 			message.releases = append(message.releases, release)
 		}
 	}
-	defer func() {
-		for _, release := range message.releases {
-			release()
-		}
-	}()
 	select {
 	case c.clusterConfigBox <- message:
-		if c.folderAdmit != nil {
+		if c.folderAdmit != nil || c.announcementAdmit != nil {
 			<-message.done
 		}
 	case <-c.closed:
 	}
 }
-func (c *rawConnection) writeClusterConfig(message clusterConfigMessage) error {
+
+// A partial ClusterConfig would falsely withdraw fenced folders. Drop the
+// entire stale snapshot; the embedding model regenerates it after reopening.
+func (c *rawConnection) writeClusterConfig(message clusterConfigMessage) (bool, error) {
 	defer close(message.done)
-	if message.scopes != nil {
-		folders := message.config.Folders[:0]
-		for i, folder := range message.config.Folders {
-			if message.scopes[i].Err() == nil {
-				folders = append(folders, folder)
-			}
+	for _, scope := range message.scopes {
+		if scope.Err() != nil {
+			return false, nil
 		}
-		message.config.Folders = folders
 	}
-	return c.writeMessage(message.config.toWire())
+	return true, c.writeMessage(message.config.toWire())
 }
 
 func (c *rawConnection) Closed() <-chan struct{} {
@@ -839,20 +857,27 @@ func (c *rawConnection) send(ctx context.Context, msg proto.Message, done chan s
 }
 
 func (c *rawConnection) writerLoop() {
-	select {
-	case cc := <-c.clusterConfigBox:
-		err := c.writeClusterConfig(cc)
-		if err != nil {
-			c.internalClose(err)
+initial:
+	for {
+		select {
+		case cc := <-c.clusterConfigBox:
+			written, err := c.writeClusterConfig(cc)
+			if err != nil {
+				c.internalClose(err)
+				return
+			}
+			if written {
+				break initial
+			}
+		case hm := <-c.closeBox:
+			_ = c.writeMessage(hm.msg)
+			close(hm.done)
+			return
+		case <-c.closed:
 			return
 		}
-	case hm := <-c.closeBox:
-		_ = c.writeMessage(hm.msg)
-		close(hm.done)
-		return
-	case <-c.closed:
-		return
 	}
+
 	for {
 		// When the connection is closing or closed, that should happen
 		// immediately, not compete with the (potentially very busy) outbox.
@@ -867,7 +892,7 @@ func (c *rawConnection) writerLoop() {
 		}
 		select {
 		case cc := <-c.clusterConfigBox:
-			err := c.writeClusterConfig(cc)
+			_, err := c.writeClusterConfig(cc)
 			if err != nil {
 				c.internalClose(err)
 				return

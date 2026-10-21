@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"github.com/syncthing/syncthing/lib/config"
+	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/protocol"
 	relayprotocol "github.com/syncthing/syncthing/lib/relay/protocol"
 	"net/url"
@@ -124,5 +125,56 @@ func TestNativeRelayRetryStopsAndFreshEngineRecovers(t *testing.T) {
 		if calls != 1 || releases != 1 {
 			t.Fatal(calls, releases)
 		}
+	}
+}
+
+// The first equal-priority connection consumes the steady-state slot; a better
+// path must still pass the same check for the reserved handoff slot.
+type nativePolicyConnection struct {
+	protocol.Connection
+	local    bool
+	priority int
+}
+
+func (c nativePolicyConnection) IsLocal() bool { return c.local }
+func (c nativePolicyConnection) Priority() int { return c.priority }
+func TestNativeWANConnectionTargetAndHandoff(t *testing.T) {
+	id := protocol.NewDeviceID([]byte("native-peer"))
+	cfg := config.New(protocol.LocalDeviceID)
+	cfg.Devices = append(cfg.Devices, config.DeviceConfiguration{DeviceID: id, RawNumConnections: 3})
+	s := &service{cfg: config.Wrap("", cfg, protocol.LocalDeviceID, events.NoopLogger)}
+	s.connections = map[protocol.DeviceID][]protocol.Connection{id: {nativePolicyConnection{priority: 50}}}
+	s.wantConnections = map[protocol.DeviceID]int{id: 3}
+	if got := s.desiredConnectionsToDevice(id); got != 3 {
+		t.Fatal("legacy target", got)
+	}
+	active := true
+	s.options.SingleWANConnection = func() bool { return active }
+	if got := s.desiredConnectionsToDevice(id); got != 1 {
+		t.Fatal("WAN target", got)
+	}
+	if s.helloForDevice(id, false).NumConnections != 1 || s.helloForDevice(id, true).NumConnections != 3 {
+		t.Fatal("Hello policy changed LAN or missed WAN")
+	}
+	if err := s.connectionCheckEarly(id, internalConn{priority: 50}); !errors.Is(err, errDeviceAlreadyConnected) {
+		t.Fatal("duplicate occupied upgrade slot", err)
+	}
+	if err := s.connectionCheckEarly(id, internalConn{priority: 30}); err != nil {
+		t.Fatal("upgrade rejected", err)
+	}
+	s.connections[id] = []protocol.Connection{nativePolicyConnection{priority: 30}}
+	if err := s.connectionCheckEarly(id, internalConn{priority: 30}); !errors.Is(err, errDeviceAlreadyConnected) {
+		t.Fatal("stale concurrent Hello accepted", err)
+	}
+	s.connections[id] = []protocol.Connection{nativePolicyConnection{local: true, priority: 10}}
+	if got := s.desiredConnectionsToDevice(id); got != 3 {
+		t.Fatal("LAN target changed", got)
+	}
+	active = false
+	if s.helloForDevice(id, false).NumConnections != 3 {
+		t.Fatal("legacy policy not restored")
+	}
+	if s.desiredConnectionsToDevice(protocol.NewDeviceID([]byte("unknown"))) != 0 {
+		t.Fatal("unknown peer target")
 	}
 }
