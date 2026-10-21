@@ -23,6 +23,7 @@ import (
 // the package, it is not intended as a stable API at this time. It does however provide a boundary between the more
 // volatile Model interface and upstream users (one of which is an iOS app).
 type Internals struct {
+	quiesce     func(context.Context) error
 	model       model.Model
 	connections connections.Service
 }
@@ -235,4 +236,12 @@ func (m *Internals) ConnectionAddresses() []string {
 		return nil
 	}
 	return m.connections.AllAddresses()
+}
+
+// QuiesceConnections preserves model resources for the embedding drain owner.
+func (m *Internals) QuiesceConnections(ctx context.Context) error {
+	if m.quiesce != nil {
+		return m.quiesce(ctx)
+	}
+	return nil
 }

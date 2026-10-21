@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"testing"
@@ -200,7 +201,7 @@ func TestClusterConfigFirst(t *testing.T) {
 	defer closeAndWait(c, rw)
 
 	select {
-	case c.outbox <- asyncMessage{&bep.Ping{}, nil}:
+	case c.outbox <- asyncMessage{msg: &bep.Ping{}}:
 		t.Fatal("able to send ping before cluster config")
 	case <-time.After(100 * time.Millisecond):
 		// Allow some time for c.writerLoop to set up after c.Start
@@ -635,6 +636,181 @@ func TestConcurrentStartAndClose(t *testing.T) {
 		case <-m.closedCh:
 		case <-time.After(time.Second):
 			t.Fatal("missing close callback")
+		}
+	}
+}
+
+func TestFolderCancellationSkipsQueuedBytesAndPreservesControl(t *testing.T) {
+	var output bytes.Buffer
+	c := newRawConnection(c0ID, bytes.NewReader(nil), &output, testutil.NoopCloser{}, nil, new(mockedConnectionInfo), CompressionNever)
+	c.outbox = make(chan asyncMessage, 3)
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	responseDone, indexDone, pingDone := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	c.outbox <- asyncMessage{ctx: canceled, msg: (&Response{ID: 7, Data: []byte("revoked data")}).toWire(), done: responseDone}
+	c.outbox <- asyncMessage{ctx: canceled, msg: (&Index{Folder: "revoked"}).toWire(), done: indexDone}
+	c.outbox <- asyncMessage{msg: &bep.Ping{}, done: pingDone}
+	exited := make(chan struct{})
+	go func() { defer close(exited); c.writerLoop() }()
+	ccDone := make(chan struct{})
+	c.clusterConfigBox <- clusterConfigMessage{config: &ClusterConfig{}, done: ccDone}
+	<-ccDone
+	<-responseDone
+	<-indexDone
+	<-pingDone
+	close(c.closed)
+	<-exited
+	reader := newRawConnection(c1ID, bytes.NewReader(output.Bytes()), io.Discard, testutil.NoopCloser{}, nil, new(mockedConnectionInfo), CompressionNever)
+	if _, err := reader.readMessage(make([]byte, 4)); err != nil {
+		t.Fatal(err)
+	}
+	msg, err := reader.readMessage(make([]byte, 4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, ok := msg.(*bep.Response)
+	if !ok || len(response.Data) != 0 || response.Code == bep.ErrorCode_ERROR_CODE_NO_ERROR {
+		t.Fatalf("revoked response: %v", msg)
+	}
+	msg, err = reader.readMessage(make([]byte, 4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := msg.(*bep.Ping); !ok {
+		t.Fatalf("shared control damaged: %v", msg)
+	}
+}
+
+type heldFolderWriter struct{ entered, resume chan struct{} }
+
+func (w heldFolderWriter) Write(p []byte) (int, error) {
+	select {
+	case w.entered <- struct{}{}:
+	default:
+	}
+	<-w.resume
+	return len(p), nil
+}
+func TestFolderIndexBorrowEndsAfterActualWrite(t *testing.T) {
+	c := newRawConnection(c0ID, bytes.NewReader(nil), io.Discard, testutil.NoopCloser{}, nil, new(mockedConnectionInfo), CompressionNever)
+	scope, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	released := make(chan struct{})
+	c.folderAdmit = func(context.Context, string) (context.Context, func(), error) {
+		return scope, func() { close(released) }, nil
+	}
+	exited := make(chan struct{})
+	go func() { defer close(exited); c.writerLoop() }()
+	ccDone := make(chan struct{})
+	c.clusterConfigBox <- clusterConfigMessage{config: &ClusterConfig{}, done: ccDone}
+	<-ccDone
+	// No write is active between the initial config and Index submission.
+	writer := heldFolderWriter{make(chan struct{}, 1), make(chan struct{})}
+	c.cw = &countingWriter{Writer: writer}
+	done := make(chan error, 1)
+	go func() { done <- c.Index(context.Background(), &Index{Folder: "one"}) }()
+	<-writer.entered
+	cancel()
+	select {
+	case <-released:
+		t.Fatal("borrow released during write")
+	default:
+	}
+	close(writer.resume)
+	<-done
+	<-released
+	close(c.closed)
+	<-exited
+}
+
+func TestFolderIndexCancellationDoesNotWaitForOtherFolderWrite(t *testing.T) {
+	for _, update := range []bool{false, true} {
+		for _, disconnect := range []bool{false, true} {
+			t.Run(fmt.Sprintf("update=%v/disconnect=%v", update, disconnect), func(t *testing.T) {
+				c := newRawConnection(c0ID, bytes.NewReader(nil), io.Discard, testutil.NoopCloser{}, nil, new(mockedConnectionInfo), CompressionNever)
+				bCtx, cancelB := context.WithCancel(context.Background())
+				defer cancelB()
+				aReleased, bReleased, bAdmitted := make(chan struct{}), make(chan struct{}), make(chan struct{})
+				c.folderAdmit = func(_ context.Context, folder string) (context.Context, func(), error) {
+					switch folder {
+					case "A":
+						return context.Background(), func() { close(aReleased) }, nil
+					case "B":
+						close(bAdmitted)
+						return bCtx, func() { close(bReleased) }, nil
+					default:
+						return context.Background(), func() {}, nil
+					}
+				}
+				exited := make(chan struct{})
+				go func() { defer close(exited); c.writerLoop() }()
+				ccDone := make(chan struct{})
+				c.clusterConfigBox <- clusterConfigMessage{config: &ClusterConfig{}, done: ccDone}
+				<-ccDone
+				writer := heldFolderWriter{make(chan struct{}, 1), make(chan struct{})}
+				c.cw = &countingWriter{Writer: writer}
+				var resumeOnce, closeOnce sync.Once
+				resume := func() { resumeOnce.Do(func() { close(writer.resume) }) }
+				shutdown := func() { closeOnce.Do(func() { close(c.closed) }) }
+				aDone, bDone := make(chan error, 1), make(chan error, 1)
+				aFinished, bFinished := make(chan struct{}), make(chan struct{})
+				t.Cleanup(func() {
+					cancelB()
+					resume()
+					shutdown()
+					<-aFinished
+					<-bFinished
+					<-exited
+				})
+				go func() { defer close(aFinished); aDone <- c.Index(context.Background(), &Index{Folder: "A"}) }()
+				<-writer.entered // A owns the serial slot and is inside the actual write.
+				go func() {
+					defer close(bFinished)
+					if update {
+						bDone <- c.IndexUpdate(context.Background(), &IndexUpdate{Folder: "B"})
+					} else {
+						bDone <- c.Index(context.Background(), &Index{Folder: "B"})
+					}
+				}()
+				<-bAdmitted
+				want := context.Canceled
+				if disconnect {
+					shutdown()
+					want = ErrClosed
+				} else {
+					cancelB()
+				}
+				select {
+				case err := <-bDone:
+					if !errors.Is(err, want) {
+						t.Fatalf("B: %v, want %v", err, want)
+					}
+				case <-time.After(time.Second):
+					t.Fatal("B cancellation waited for A's blocked write")
+				}
+				select {
+				case <-bReleased:
+				default:
+					t.Fatal("B retained its folder borrow")
+				}
+				select {
+				case <-aReleased:
+					t.Fatal("A released before actual write completion")
+				default:
+				}
+				resume()
+				if err := <-aDone; err != nil {
+					t.Fatal(err)
+				}
+				<-aReleased
+				if !disconnect {
+					// B cancellation must neither close the shared connection nor
+					// consume its serialization slot permanently.
+					if err := c.IndexUpdate(context.Background(), &IndexUpdate{Folder: "C"}); err != nil {
+						t.Fatal(err)
+					}
+				}
+			})
 		}
 	}
 }

@@ -133,6 +133,7 @@ type Model interface {
 }
 
 type model struct {
+	folderAccess *FolderAccess
 	*suture.Supervisor
 
 	// constructor parameters
@@ -212,7 +213,7 @@ var (
 // NewModel creates and starts a new model. The model starts in read-only mode,
 // where it sends index information to connected peers and responds to requests
 // for file data without altering the local folder in any way.
-func NewModel(cfg config.Wrapper, id protocol.DeviceID, sdb db.DB, protectedFiles []string, evLogger events.Logger, keyGen *protocol.KeyGenerator) Model {
+func NewModel(cfg config.Wrapper, id protocol.DeviceID, sdb db.DB, protectedFiles []string, evLogger events.Logger, keyGen *protocol.KeyGenerator, access ...*FolderAccess) Model {
 	spec := svcutil.SpecWithDebugLogger()
 	m := &model{
 		Supervisor: suture.New("model", spec),
@@ -262,6 +263,9 @@ func NewModel(cfg config.Wrapper, id protocol.DeviceID, sdb db.DB, protectedFile
 	m.Add(m.indexHandlers)
 	m.Add(svcutil.AsService(m.serve, m.String()))
 
+	if len(access) > 0 {
+		m.folderAccess = access[0]
+	}
 	return m
 }
 
@@ -1161,6 +1165,14 @@ func (m *model) IndexUpdate(conn protocol.Connection, idxUp *protocol.IndexUpdat
 }
 
 func (m *model) handleIndex(conn protocol.Connection, folder string, fs []protocol.FileInfo, update bool, prevSequence, lastSequence int64) error {
+	scope, release, err := m.folderAccess.Admit(context.Background(), conn.DeviceID(), folder)
+	if err != nil {
+		return nil
+	}
+	defer release()
+	if scope.Err() != nil {
+		return nil
+	}
 	op := "Index"
 	if update {
 		op += " update"
@@ -1189,7 +1201,10 @@ func (m *model) handleIndex(conn protocol.Connection, folder string, fs []protoc
 		return fmt.Errorf("%s: %w", folder, ErrFolderNotRunning)
 	}
 
-	return indexHandler.ReceiveIndex(folder, fs, update, op, prevSequence, lastSequence)
+	if scope.Err() != nil {
+		return nil
+	}
+	return indexHandler.ReceiveIndex(folder, fs, update, op, prevSequence, lastSequence, scope)
 }
 
 type clusterConfigDeviceInfo struct {
@@ -1202,6 +1217,23 @@ type ClusterConfigReceivedEventData struct {
 
 func (m *model) ClusterConfig(conn protocol.Connection, cm *protocol.ClusterConfig) error {
 	deviceID := conn.DeviceID()
+	scopes := make(map[string]context.Context)
+	if m.folderAccess != nil {
+		snapshot := *cm
+		snapshot.Folders = nil
+		for _, folder := range cm.Folders {
+			scope, release, err := m.folderAccess.Admit(context.Background(), conn.DeviceID(), folder.ID)
+			if err != nil {
+				continue
+			}
+			defer release()
+			scopes[folder.ID] = scope
+			if scope.Err() == nil {
+				snapshot.Folders = append(snapshot.Folders, folder)
+			}
+		}
+		cm = &snapshot
+	}
 
 	if cm.Secondary {
 		// No handling of secondary connection ClusterConfigs; they merely
@@ -1289,6 +1321,17 @@ func (m *model) ClusterConfig(conn protocol.Connection, cm *protocol.ClusterConf
 		w.Wait()
 	}
 
+	// Config/registry waits above may overlap a scoped revocation. Retain
+	// completion borrows but do not start a revoked folder handler.
+	if m.folderAccess != nil {
+		folders := cm.Folders[:0]
+		for _, folder := range cm.Folders {
+			if scopes[folder.ID].Err() == nil {
+				folders = append(folders, folder)
+			}
+		}
+		cm.Folders = folders
+	}
 	tempIndexFolders, states, err := m.ccHandleFolders(cm.Folders, deviceCfg, ccDeviceInfos, indexHandlerRegistry)
 	if err != nil {
 		return err
@@ -1932,9 +1975,10 @@ func (m *model) Closed(conn protocol.Connection, err error) {
 
 // Implements protocol.RequestResponse
 type requestResponse struct {
-	data   []byte
-	closed chan struct{}
-	once   sync.Once
+	release func()
+	data    []byte
+	closed  chan struct{}
+	once    sync.Once
 }
 
 func newRequestResponse(size int) *requestResponse {
@@ -1951,6 +1995,9 @@ func (r *requestResponse) Data() []byte {
 func (r *requestResponse) Close() {
 	r.once.Do(func() {
 		protocol.BufferPool.Put(r.data)
+		if r.release != nil {
+			r.release()
+		}
 		close(r.closed)
 	})
 }
@@ -1967,6 +2014,29 @@ func (m *model) Request(conn protocol.Connection, req *protocol.Request) (out pr
 	}
 
 	deviceID := conn.DeviceID()
+
+	// Register before reading sharing state: revoke/drain must include work
+	// that could otherwise carry an old snapshot into a recreated folder.
+	scope, release, admissionErr := m.folderAccess.Admit(context.Background(), deviceID, req.Folder)
+	if admissionErr != nil {
+		return nil, protocol.ErrGeneric
+	}
+	defer func() {
+		if err != nil {
+			release()
+			return
+		}
+		if scope.Err() != nil {
+			if out != nil {
+				out.Close()
+			}
+			out = nil
+			err = protocol.ErrGeneric
+			release()
+			return
+		}
+		out = &admittedResponse{RequestResponse: out, ctx: scope, release: release}
+	}()
 
 	m.mut.RLock()
 	folderCfg, ok := m.folderCfgs[req.Folder]
@@ -2018,7 +2088,10 @@ func (m *model) Request(conn protocol.Connection, req *protocol.Request) (out pr
 
 	// The requestResponse releases the bytes to the buffer pool and the
 	// limiters when its Close method is called.
-	res := newLimitedRequestResponse(req.Size, limiter, m.globalRequestLimiter)
+	res, limitErr := newLimitedRequestResponseContext(scope, req.Size, limiter, m.globalRequestLimiter)
+	if limitErr != nil {
+		return nil, protocol.ErrGeneric
+	}
 
 	defer func() {
 		// Close it ourselves if it isn't returned due to an error
@@ -2030,6 +2103,9 @@ func (m *model) Request(conn protocol.Connection, req *protocol.Request) (out pr
 	// Grab the FS after limiting, as it causes I/O and we want to minimize
 	// the race time between the symlink check and the read.
 
+	if scope.Err() != nil {
+		return nil, protocol.ErrGeneric
+	}
 	folderFs := folderCfg.Filesystem()
 
 	if err := osutil.TraversesSymlink(folderFs, filepath.Dir(req.Name)); err != nil {
@@ -2093,17 +2169,17 @@ func (m *model) Request(conn protocol.Connection, req *protocol.Request) (out pr
 // When the requestResponse is closed the limiters are given back the bytes,
 // in reverse order.
 func newLimitedRequestResponse(size int, limiters ...*semaphore.Semaphore) *requestResponse {
-	multi := semaphore.MultiSemaphore(limiters)
-	multi.Take(size)
-
-	res := newRequestResponse(size)
-
-	go func() {
-		res.Wait()
-		multi.Give(size)
-	}()
-
+	res, _ := newLimitedRequestResponseContext(context.Background(), size, limiters...)
 	return res
+}
+func newLimitedRequestResponseContext(ctx context.Context, size int, limiters ...*semaphore.Semaphore) (*requestResponse, error) {
+	multi := semaphore.MultiSemaphore(limiters)
+	if err := multi.TakeWithContext(ctx, size); err != nil {
+		return nil, err
+	}
+	res := newRequestResponse(size)
+	res.release = func() { multi.Give(size) }
+	return res, nil
 }
 
 func (m *model) recheckFile(deviceID protocol.DeviceID, folder, name string, offset int64, hash []byte) {
@@ -2300,6 +2376,16 @@ func (m *model) AddConnection(conn protocol.Connection, hello protocol.Hello) {
 
 	m.mut.Lock()
 
+	// Close can win before the transport reaches model attachment (including
+	// global quiesce). Serialize this check with the Closed callback so an
+	// already removed connection cannot be resurrected in model state.
+	select {
+	case <-conn.Closed():
+		m.mut.Unlock()
+		return
+	default:
+	}
+
 	m.connections[connID] = conn
 	m.closed[connID] = closed
 	m.helloMessages[deviceID] = hello
@@ -2410,6 +2496,15 @@ func (m *model) promoteConnections() {
 }
 
 func (m *model) DownloadProgress(conn protocol.Connection, p *protocol.DownloadProgress) error {
+	scope, release, err := m.folderAccess.Admit(context.Background(), conn.DeviceID(), p.Folder)
+	if err != nil {
+		return nil
+	}
+	defer release()
+	if scope.Err() != nil {
+		return nil
+	}
+
 	deviceID := conn.DeviceID()
 
 	m.mut.RLock()

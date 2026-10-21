@@ -144,8 +144,7 @@ func (e encryptedModel) Request(req *Request) (RequestResponse, error) {
 		data = nd
 	}
 	enc := encryptBytes(data, fileKey)
-	resp.Close()
-	return rawResponse{enc}, nil
+	return retainedEncryptedResponse{RequestResponse: resp, data: enc}, nil
 }
 
 func (e encryptedModel) DownloadProgress(p *DownloadProgress) error {
@@ -703,4 +702,18 @@ func (r *folderKeyRegistry) setPasswords(keyGen *KeyGenerator, passwords map[str
 	r.mut.Lock()
 	r.keys = keysFromPasswords(keyGen, passwords)
 	r.mut.Unlock()
+}
+
+// Retain the source admission and byte budget until encrypted bytes are sent.
+type retainedEncryptedResponse struct {
+	RequestResponse
+	data []byte
+}
+
+func (r retainedEncryptedResponse) Data() []byte { return r.data }
+func (r retainedEncryptedResponse) Context() context.Context {
+	if scoped, ok := r.RequestResponse.(interface{ Context() context.Context }); ok {
+		return scoped.Context()
+	}
+	return context.Background()
 }

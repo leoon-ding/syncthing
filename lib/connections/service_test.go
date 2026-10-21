@@ -5,8 +5,11 @@ import (
 	"errors"
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/protocol"
+	relayprotocol "github.com/syncthing/syncthing/lib/relay/protocol"
 	"net/url"
+	"sync"
 	"testing"
+	"time"
 )
 
 type admissionTestDialer struct {
@@ -66,5 +69,60 @@ func TestDialAdmissionFailureAndRelease(t *testing.T) {
 				t.Fatal(d.calls)
 			}
 		})
+	}
+}
+
+type heldNativeClose struct {
+	protocol.Connection
+	started chan struct{}
+	done    chan struct{}
+	once    sync.Once
+}
+
+func (c *heldNativeClose) Close(error)             { c.once.Do(func() { close(c.started) }); <-c.done }
+func (c *heldNativeClose) Closed() <-chan struct{} { return c.done }
+func TestNativeQuiesceRetainsIncompleteCloseAndSealsDial(t *testing.T) {
+	conn := &heldNativeClose{started: make(chan struct{}), done: make(chan struct{})}
+	s := &service{}
+	s.connections = map[protocol.DeviceID][]protocol.Connection{protocol.EmptyDeviceID: {conn}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := s.Quiesce(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	<-conn.started
+	dialer := &admissionTestDialer{}
+	if _, err := s.dialWithAdmission(context.Background(), dialTarget{dialer: dialer}); !errors.Is(err, context.Canceled) || dialer.calls != 0 {
+		t.Fatal("dial after quiesce", err)
+	}
+	close(conn.done)
+	if err := s.Quiesce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+func TestNativeRelayRetryStopsAndFreshEngineRecovers(t *testing.T) {
+	for generation := 0; generation < 2; generation++ {
+		network, cancel := context.WithCancel(context.Background())
+		called, exited := make(chan struct{}), make(chan struct{})
+		calls, releases := 0, 0
+		s := &service{networkCtx: network, networkCancel: cancel}
+		s.options.PrivateRelay = func(context.Context) (context.Context, *url.URL, relayprotocol.PermitToken, func(), error) {
+			calls++
+			close(called)
+			return nil, nil, "", func() { releases++ }, errors.New("retryable")
+		}
+		go func() { defer close(exited); _ = s.servePrivateRelay(context.Background()) }()
+		<-called
+		if err := s.Quiesce(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-exited:
+		case <-time.After(time.Second):
+			t.Fatal("relay retry ignored stop")
+		}
+		if calls != 1 || releases != 1 {
+			t.Fatal(calls, releases)
+		}
 	}
 }

@@ -119,6 +119,7 @@ const (
 )
 
 type dbUpdateJob struct {
+	barrier chan struct{}
 	file    protocol.FileInfo
 	jobType dbUpdateType
 }
@@ -343,7 +344,7 @@ loop:
 		case f.ignores.Match(file.Name).IsIgnored():
 			file.SetIgnored()
 			f.sl.DebugContext(ctx, "Handling ignored file", file.LogAttr())
-			dbUpdateChan <- dbUpdateJob{file, dbUpdateInvalidate}
+			dbUpdateChan <- dbUpdateJob{file: file, jobType: dbUpdateInvalidate}
 
 		case build.IsWindows && fs.WindowsInvalidFilename(file.Name) != nil:
 			if file.IsDeleted() {
@@ -351,7 +352,7 @@ loop:
 				// about a deleted file that we can't have anyway.
 				// Reason we need it in the first place is, that it was
 				// ignored at some point.
-				dbUpdateChan <- dbUpdateJob{file, dbUpdateDeleteFile}
+				dbUpdateChan <- dbUpdateJob{file: file, jobType: dbUpdateDeleteFile}
 			} else {
 				// We can't pull an invalid file. Grab the error again since
 				// we couldn't assign it directly in the case clause.
@@ -407,7 +408,7 @@ loop:
 			}
 			file.SetUnsupported()
 			f.sl.DebugContext(ctx, "Invalidating unsupported symlink", slogutil.FilePath(file.Name))
-			dbUpdateChan <- dbUpdateJob{file, dbUpdateInvalidate}
+			dbUpdateChan <- dbUpdateJob{file: file, jobType: dbUpdateInvalidate}
 
 		case file.IsDirectory() && !file.IsSymlink():
 			f.sl.DebugContext(ctx, "Handling directory", slogutil.FilePath(file.Name))
@@ -651,7 +652,7 @@ func (f *sendReceiveFolder) handleDir(file protocol.FileInfo, dbUpdateChan chan<
 		}
 
 		if err = f.inWritableDir(mkdir, file.Name); err == nil {
-			dbUpdateChan <- dbUpdateJob{file, dbUpdateHandleDir}
+			dbUpdateChan <- dbUpdateJob{file: file, jobType: dbUpdateHandleDir}
 		} else {
 			f.newPullError(file.Name, fmt.Errorf("creating directory: %w", err))
 		}
@@ -676,7 +677,7 @@ func (f *sendReceiveFolder) handleDir(file protocol.FileInfo, dbUpdateChan chan<
 			return
 		}
 	}
-	dbUpdateChan <- dbUpdateJob{file, dbUpdateHandleDir}
+	dbUpdateChan <- dbUpdateJob{file: file, jobType: dbUpdateHandleDir}
 }
 
 // checkParent verifies that the thing we are handling lives inside a directory,
@@ -774,7 +775,7 @@ func (f *sendReceiveFolder) handleSymlink(file protocol.FileInfo, dbUpdateChan c
 	}
 
 	if err = f.inWritableDir(createLink, file.Name); err == nil {
-		dbUpdateChan <- dbUpdateJob{file, dbUpdateHandleSymlink}
+		dbUpdateChan <- dbUpdateJob{file: file, jobType: dbUpdateHandleSymlink}
 	} else {
 		f.newPullError(file.Name, fmt.Errorf("symlink create: %w", err))
 	}
@@ -850,7 +851,7 @@ func (f *sendReceiveFolder) deleteDir(file protocol.FileInfo, dbUpdateChan chan<
 	if err = f.checkToBeDeleted(file, cur, hasCur, scanChan); err != nil {
 		if fs.IsNotExist(err) || fs.IsErrCaseConflict(err) {
 			err = nil
-			dbUpdateChan <- dbUpdateJob{file, dbUpdateDeleteDir}
+			dbUpdateChan <- dbUpdateJob{file: file, jobType: dbUpdateDeleteDir}
 		}
 		return
 	}
@@ -859,7 +860,7 @@ func (f *sendReceiveFolder) deleteDir(file protocol.FileInfo, dbUpdateChan chan<
 		return
 	}
 
-	dbUpdateChan <- dbUpdateJob{file, dbUpdateDeleteDir}
+	dbUpdateChan <- dbUpdateJob{file: file, jobType: dbUpdateDeleteDir}
 }
 
 // deleteFile attempts to delete the given file
@@ -909,7 +910,7 @@ func (f *sendReceiveFolder) deleteFileWithCurrent(file, cur protocol.FileInfo, h
 	if err = f.checkToBeDeleted(file, cur, hasCur, scanChan); err != nil {
 		if fs.IsNotExist(err) || fs.IsErrCaseConflict(err) {
 			err = nil
-			dbUpdateChan <- dbUpdateJob{file, dbUpdateDeleteFile}
+			dbUpdateChan <- dbUpdateJob{file: file, jobType: dbUpdateDeleteFile}
 		}
 		return
 	}
@@ -940,7 +941,7 @@ func (f *sendReceiveFolder) deleteFileWithCurrent(file, cur protocol.FileInfo, h
 
 	if err == nil || fs.IsNotExist(err) {
 		// It was removed or it doesn't exist to start with
-		dbUpdateChan <- dbUpdateJob{file, dbUpdateDeleteFile}
+		dbUpdateChan <- dbUpdateJob{file: file, jobType: dbUpdateDeleteFile}
 		return
 	}
 
@@ -950,7 +951,7 @@ func (f *sendReceiveFolder) deleteFileWithCurrent(file, cur protocol.FileInfo, h
 		// does not exist" (possibly expressed as some parent being a file and
 		// not a directory etc) and that the delete is handled.
 		err = nil
-		dbUpdateChan <- dbUpdateJob{file, dbUpdateDeleteFile}
+		dbUpdateChan <- dbUpdateJob{file: file, jobType: dbUpdateDeleteFile}
 	}
 
 	slog.Info("Deleted file", f.LogAttr(), file.LogAttr())
@@ -1086,7 +1087,7 @@ func (f *sendReceiveFolder) renameFile(cur, source, target protocol.FileInfo, db
 		return err
 	}
 
-	dbUpdateChan <- dbUpdateJob{source, dbUpdateDeleteFile}
+	dbUpdateChan <- dbUpdateJob{file: source, jobType: dbUpdateDeleteFile}
 
 	return nil
 }
@@ -1322,7 +1323,7 @@ func (f *sendReceiveFolder) shortcutFile(file protocol.FileInfo, dbUpdateChan ch
 
 	f.mtimefs.Chtimes(file.Name, file.ModTime(), file.ModTime()) // never fails
 
-	dbUpdateChan <- dbUpdateJob{file, dbUpdateShortcutFile}
+	dbUpdateChan <- dbUpdateJob{file: file, jobType: dbUpdateShortcutFile}
 }
 
 // copierRoutine reads copierStates until the in channel closes and performs
@@ -1594,10 +1595,15 @@ loop:
 
 		// Fetch the block, while marking the selected device as in use so that
 		// leastBusy can select another device when someone else asks.
+		sourceCtx, admitErr := state.admitSource(ctx, f.model.folderAccess, selected.ID)
+		if admitErr != nil {
+			lastError = admitErr
+			continue
+		}
 		activity.using(selected)
 		var buf []byte
 		blockNo := int(state.block.Offset / int64(state.file.BlockSize()))
-		buf, lastError = f.model.RequestGlobal(ctx, selected.ID, f.folderID, state.file.Name, blockNo, state.block.Offset, state.block.Size, state.block.Hash, selected.FromTemporary)
+		buf, lastError = f.model.RequestGlobal(sourceCtx, selected.ID, f.folderID, state.file.Name, blockNo, state.block.Offset, state.block.Size, state.block.Hash, selected.FromTemporary)
 		activity.done(selected)
 		if lastError != nil {
 			f.sl.DebugContext(ctx, "Block request returned error", slogutil.FilePath(state.file.Name), "offset", state.block.Offset, "size", state.block.Size, "device", selected.ID.Short(), slogutil.Error(lastError))
@@ -1618,8 +1624,12 @@ loop:
 			continue
 		}
 
-		// Save the block data we got from the cluster
-		err = f.limitedWriteAt(ctx, fd, buf, state.block.Offset)
+		// Save only while the retained source borrow is still valid.
+		if err = sourceCtx.Err(); err != nil {
+			state.fail(err)
+			break
+		}
+		err = f.limitedWriteAt(sourceCtx, fd, buf, state.block.Offset)
 		if err != nil {
 			state.fail(fmt.Errorf("save: %w", err))
 		} else {
@@ -1680,7 +1690,7 @@ func (f *sendReceiveFolder) performFinish(file, curFile protocol.FileInfo, hasCu
 	f.mtimefs.Chtimes(file.Name, file.ModTime(), file.ModTime()) // never fails
 
 	// Record the updated file in the index
-	dbUpdateChan <- dbUpdateJob{file, dbUpdateHandleFile}
+	dbUpdateChan <- dbUpdateJob{file: file, jobType: dbUpdateHandleFile}
 	return nil
 }
 
@@ -1692,9 +1702,20 @@ func (f *sendReceiveFolder) finisherRoutine(ctx context.Context, in <-chan *shar
 			f.queue.Done(state.file.Name)
 
 			if err == nil {
+				err = state.sourceError()
+			}
+			if err == nil {
 				err = f.performFinish(state.file, state.curFile, state.hasCurFile, state.tempName, dbUpdateChan, scanChan)
 			}
 
+			// Flush the queued commit before releasing source borrows. A timeout
+			// in the embedding owner cannot turn outstanding DB work into success.
+			if state.hasSources() {
+				barrier := make(chan struct{})
+				dbUpdateChan <- dbUpdateJob{barrier: barrier}
+				<-barrier
+				state.releaseSources()
+			}
 			if err != nil {
 				f.newPullError(state.file.Name, fmt.Errorf("finishing: %w", err))
 			} else {
@@ -1784,6 +1805,11 @@ loop:
 				break loop
 			}
 
+			if job.barrier != nil {
+				batch.Flush()
+				close(job.barrier)
+				continue
+			}
 			switch job.jobType {
 			case dbUpdateHandleFile, dbUpdateShortcutFile:
 				changedDirs[filepath.Dir(job.file.Name)] = struct{}{}
@@ -2196,6 +2222,9 @@ func (f *sendReceiveFolder) withLimiter(ctx context.Context, fn func() error) er
 		return err
 	}
 	defer f.writeLimiter.Give(1)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	return fn()
 }
 

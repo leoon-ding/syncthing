@@ -353,13 +353,22 @@ func (s *indexHandler) sendIndexTo(ctx context.Context) error {
 	return batch.Flush()
 }
 
-func (s *indexHandler) receive(fs []protocol.FileInfo, update bool, op string, prevSequence, lastSequence int64) error {
+func (s *indexHandler) receive(fs []protocol.FileInfo, update bool, op string, prevSequence, lastSequence int64, scopes ...context.Context) error {
+	valid := func() bool { return len(scopes) == 0 || scopes[0].Err() == nil }
+	if !valid() {
+		return nil
+	}
+
 	deviceID := s.conn.DeviceID()
 
 	s.cond.L.Lock()
 	paused := s.paused
 	runner := s.runner
 	s.cond.L.Unlock()
+
+	if !valid() {
+		return nil
+	}
 
 	if paused {
 		slog.Warn("Unexpected operation on paused folder", "op", op, "folder", s.folder)
@@ -434,6 +443,9 @@ func (s *indexHandler) receive(fs []protocol.FileInfo, update bool, op string, p
 		})
 	}
 
+	if !valid() {
+		return nil
+	}
 	if err := s.sdb.Update(s.folder, deviceID, fs); err != nil {
 		return err
 	}
@@ -658,7 +670,7 @@ func (r *indexHandlerRegistry) folderRunningLocked(folder config.FolderConfigura
 	}
 }
 
-func (r *indexHandlerRegistry) ReceiveIndex(folder string, fs []protocol.FileInfo, update bool, op string, prevSequence, lastSequence int64) error {
+func (r *indexHandlerRegistry) ReceiveIndex(folder string, fs []protocol.FileInfo, update bool, op string, prevSequence, lastSequence int64, scopes ...context.Context) error {
 	r.mut.Lock()
 	defer r.mut.Unlock()
 	is, isOk := r.indexHandlers.Get(folder)
@@ -666,7 +678,7 @@ func (r *indexHandlerRegistry) ReceiveIndex(folder string, fs []protocol.FileInf
 		slog.Warn("Unexpected operation on nonexistent or paused folder", "op", op, "folder", folder)
 		return fmt.Errorf("%s: %w", folder, ErrFolderMissing)
 	}
-	return is.receive(fs, update, op, prevSequence, lastSequence)
+	return is.receive(fs, update, op, prevSequence, lastSequence, scopes...)
 }
 
 // makeForgetUpdate takes an index update and constructs a download progress update

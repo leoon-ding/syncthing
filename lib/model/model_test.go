@@ -17,6 +17,7 @@ import (
 	mrand "math/rand"
 	"os"
 	"path/filepath"
+	"runtime"
 	"runtime/pprof"
 	"slices"
 	"strconv"
@@ -4100,4 +4101,133 @@ func countIterator[T any](t *testing.T) func(it iter.Seq[T], errFn func() error)
 		}
 		return count
 	}
+}
+
+type alreadyClosedModelConnection struct {
+	protocol.Connection
+	done <-chan struct{}
+}
+
+func (c alreadyClosedModelConnection) Closed() <-chan struct{} { return c.done }
+func TestAddConnectionRejectsCompletedQuiesce(t *testing.T) {
+	cfg, _ := newDefaultCfgWrapper(t)
+	m := setupModel(t, cfg)
+	defer cleanupModel(m)
+	closed := make(chan struct{})
+	close(closed)
+	m.AddConnection(alreadyClosedModelConnection{device1Conn, closed}, protocol.Hello{})
+	m.mut.RLock()
+	defer m.mut.RUnlock()
+	if len(m.deviceConnIDs[device1]) != 0 {
+		t.Fatal("closed connection resurrected")
+	}
+}
+
+func TestRequestAdmissionPrecedesSnapshotAndFolderRecreation(t *testing.T) {
+	cfg, folder := newDefaultCfgWrapper(t)
+	m := setupModel(t, cfg)
+	defer cleanupModel(m)
+	gate := new(FolderAccess)
+	m.folderAccess = gate
+	file, err := folder.Filesystem().Create("private.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Write([]byte("private")); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Pause before the model snapshot without adding a production test hook.
+	m.mut.Lock()
+	var unlockOnce sync.Once
+	unlock := func() { unlockOnce.Do(m.mut.Unlock) }
+	finished := make(chan struct{})
+	result := make(chan error, 1)
+	defer func() { unlock(); <-finished }()
+	go func() {
+		defer close(finished)
+		response, err := m.Request(device1Conn, &protocol.Request{Folder: "default", Name: "private.txt", Size: 7})
+		if response != nil {
+			response.Close()
+		}
+		result <- err
+	}()
+	deadline := time.After(time.Second)
+	for {
+		gate.mu.Lock()
+		registered := len(gate.work) == 1
+		gate.mu.Unlock()
+		if registered {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("request waited for sharing snapshot before registering admission")
+		default:
+			runtime.Gosched()
+		}
+	}
+	gate.Seal(protocol.EmptyDeviceID, "default")
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := gate.Drain(canceled, protocol.EmptyDeviceID, "default"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("drain overlooked old request: %v", err)
+	}
+	if err := gate.Open(protocol.EmptyDeviceID, "default"); !errors.Is(err, ErrFolderAccessClosed) {
+		t.Fatalf("reopened with old request outstanding: %v", err)
+	}
+	unlock()
+	if err := <-result; !errors.Is(err, protocol.ErrGeneric) {
+		t.Fatalf("old request was not rejected: %v", err)
+	}
+	if err := gate.Drain(canceled, protocol.EmptyDeviceID, "default"); err != nil {
+		t.Fatalf("completed request retained borrow: %v", err)
+	}
+
+	// Exercise the real model's remove/re-add handlers, retaining the folder
+	// ID and files but excluding the previously authorized device.
+	waiter, err := cfg.RemoveFolder("default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter.Wait()
+	waiter, err = cfg.Modify(func(c *config.Configuration) {
+		recreated := folder
+		recreated.Devices = nil
+		c.Folders = append(c.Folders, recreated)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter.Wait()
+	if err := gate.Open(protocol.EmptyDeviceID, "default"); err != nil {
+		t.Fatal(err)
+	}
+	response, err := m.Request(device1Conn, &protocol.Request{Folder: "default", Name: "private.txt", Size: 7})
+	if response != nil {
+		response.Close()
+	}
+	if !errors.Is(err, protocol.ErrGeneric) {
+		t.Fatalf("recreated folder authorized old peer: %v", err)
+	}
+	if err := gate.Drain(canceled, protocol.EmptyDeviceID, "default"); err != nil {
+		t.Fatalf("authorization rejection leaked admission: %v", err)
+	}
+
+	waiter, err = cfg.Modify(func(c *config.Configuration) { c.Folders = []config.FolderConfiguration{folder} })
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter.Wait()
+	response, err = m.Request(device1Conn, &protocol.Request{Folder: "default", Name: "private.txt", Size: 7})
+	if err != nil {
+		t.Fatalf("new authorization did not recover: %v", err)
+	}
+	if string(response.Data()) != "private" {
+		t.Fatal("unexpected file contents")
+	}
+	response.Close()
 }

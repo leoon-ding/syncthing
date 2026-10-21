@@ -220,6 +220,14 @@ func (relayListenerFactory) Valid(cfg config.Configuration) error {
 // servePrivateRelay borrows one embedding run while preserving the native
 // listener/session implementation. No endpoint is added to persisted config.
 func (s *service) servePrivateRelay(ctx context.Context) error {
+	if s.networkCtx != nil {
+		scope, cancel := context.WithCancel(ctx)
+		stop := context.AfterFunc(s.networkCtx, cancel)
+		defer stop()
+		defer cancel()
+		ctx = scope
+	}
+
 	backoff := time.Second
 	for ctx.Err() == nil {
 		scope, uri, token, release, err := s.options.PrivateRelay(ctx)

@@ -131,6 +131,7 @@ var tlsVersionNames = map[uint16]string{
 // behavior. STUNServers is read concurrently and must return an owned snapshot.
 // It controls STUN only; NATEnabled continues to control router port mapping.
 type Options struct {
+	FolderAdmit    func(context.Context, protocol.DeviceID, string) (context.Context, func(), error)
 	PrivateRelay   func(context.Context) (context.Context, *url.URL, relayprotocol.PermitToken, func(), error)
 	PrivateRenew   func(context.Context, *url.URL) (relayprotocol.PermitToken, error)
 	PrivateConnect func(context.Context, protocol.DeviceID, *url.URL) (relayprotocol.PermitToken, error)
@@ -173,6 +174,10 @@ type connWithHello struct {
 }
 
 type service struct {
+	networkCtx    context.Context
+	networkCancel context.CancelFunc
+	admissionMu   sync.Mutex
+	quiescing     bool
 	*suture.Supervisor
 	connectionStatusHandler
 	deviceConnectionTracker
@@ -204,13 +209,15 @@ type service struct {
 	listenerTokens map[string]suture.ServiceToken
 }
 
-func NewService(cfg config.Wrapper, myID protocol.DeviceID, mdl Model, tlsCfg *tls.Config, discoverer discover.Finder, bepProtocolName string, tlsDefaultCommonName string, evLogger events.Logger, registry *registry.Registry, keyGen *protocol.KeyGenerator, options ...Options) Service {
+func NewService(cfg config.Wrapper, myID protocol.DeviceID, mdl Model, tlsCfg *tls.Config, discoverer discover.Finder, bepProtocolName string, tlsDefaultCommonName string, evLogger events.Logger, registry *registry.Registry, keyGen *protocol.KeyGenerator, options ...Options) *service {
 	var opts Options
 	if len(options) > 0 {
 		opts = options[0]
 	}
+	networkCtx, networkCancel := context.WithCancel(context.Background())
 	spec := svcutil.SpecWithInfoLogger()
 	service := &service{
+		networkCtx: networkCtx, networkCancel: networkCancel,
 		Supervisor:              suture.New("connections.Service", spec),
 		connectionStatusHandler: newConnectionStatusHandler(),
 
@@ -473,9 +480,24 @@ func (s *service) handleHellos(ctx context.Context) error {
 		// connections are limited.
 		rd, wr := s.limiter.getLimiters(remoteID, c, c.IsLocal())
 
-		protoConn := protocol.NewConnection(remoteID, rd, wr, c, s.model, c, deviceCfg.Compression.ToProtocol(), s.keyGen)
+		var folderAdmit func(context.Context, string) (context.Context, func(), error)
+		if s.options.FolderAdmit != nil {
+			folderAdmit = func(ctx context.Context, folder string) (context.Context, func(), error) {
+				return s.options.FolderAdmit(ctx, remoteID, folder)
+			}
+		}
+		protoConn := protocol.NewConnection(remoteID, rd, wr, c, s.model, c, deviceCfg.Compression.ToProtocol(), s.keyGen, folderAdmit)
 		stopAdmission := context.AfterFunc(admissionCtx, func() { protoConn.Close(context.Canceled) })
+		s.admissionMu.Lock()
+		if s.quiescing {
+			s.admissionMu.Unlock()
+			stopAdmission()
+			c.Close()
+			release()
+			continue
+		}
 		s.accountAddedConnection(protoConn, hello, s.cfg.Options().ConnectionPriorityUpgradeThreshold)
+		s.admissionMu.Unlock()
 		go func() {
 			<-protoConn.Closed()
 			stopAdmission()
@@ -1164,6 +1186,12 @@ func IsAllowedNetwork(host string, allowed []string) bool {
 }
 
 func (s *service) dialWithAdmission(ctx context.Context, target dialTarget) (internalConn, error) {
+	s.admissionMu.Lock()
+	sealed := s.quiescing
+	s.admissionMu.Unlock()
+	if sealed {
+		return internalConn{}, context.Canceled
+	}
 	if s.options.BeforeDial != nil {
 		local := false
 		if uri, e := url.Parse(target.addr); e == nil && s.lanChecker != nil && uri.Hostname() != "" && (strings.HasPrefix(uri.Scheme, "tcp") || strings.HasPrefix(uri.Scheme, "quic")) {
@@ -1536,4 +1564,38 @@ func newConnectionID(t0, t1 int64) string {
 	// character in the middle that is a mix of bits from the timestamp and
 	// from the random. We want the timestamp part deterministic.
 	return enc.EncodeToString(buf[:8]) + enc.EncodeToString(buf[8:])
+}
+
+// Quiesce seals attachment and closes current connections without tearing down
+// model/database dependencies. The embedding owner drains folder work next.
+func (s *service) Quiesce(ctx context.Context) error {
+	s.admissionMu.Lock()
+	s.quiescing = true
+	if s.networkCancel != nil {
+		s.networkCancel()
+	}
+	s.connectionsMut.Lock()
+	var conns []protocol.Connection
+	for _, group := range s.connections {
+		conns = append(conns, group...)
+	}
+	s.connectionsMut.Unlock()
+	s.admissionMu.Unlock()
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	for _, conn := range conns {
+		wg.Add(1)
+		go func(c protocol.Connection) {
+			defer wg.Done()
+			c.Close(errors.New("native runtime stopping"))
+			<-c.Closed()
+		}(conn)
+	}
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }

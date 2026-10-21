@@ -52,6 +52,7 @@ const (
 )
 
 type Options struct {
+	FolderAccess          *model.FolderAccess
 	AuditWriter           io.Writer
 	NoUpgrade             bool
 	ProfilerAddr          string
@@ -253,7 +254,7 @@ func (a *App) startup() error {
 	}
 
 	keyGen := protocol.NewKeyGenerator()
-	m := model.NewModel(a.cfg, a.myID, a.sdb, protectedFiles, a.evLogger, keyGen)
+	m := model.NewModel(a.cfg, a.myID, a.sdb, protectedFiles, a.evLogger, keyGen, a.opts.FolderAccess)
 	a.Internals = newInternals(m)
 
 	a.mainService.Add(m)
@@ -282,6 +283,7 @@ func (a *App) startup() error {
 	addrLister.AddressLister = connectionsService
 
 	a.Internals.connections = connectionsService
+	a.Internals.quiesce = connectionsService.Quiesce
 	a.mainService.Add(discoveryManager)
 	a.mainService.Add(connectionsService)
 
