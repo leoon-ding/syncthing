@@ -443,9 +443,9 @@ func (s *indexHandler) receive(fs []protocol.FileInfo, update bool, op string, p
 		})
 	}
 
-	if !valid() {
-		return nil
-	}
+	// Once mutation starts, finish the admitted index replacement before releasing
+	// its folder borrow. Cancellation between DropAllFiles and Update would leave
+	// a successful but empty index; revocation drains this operation instead.
 	if err := s.sdb.Update(s.folder, deviceID, fs); err != nil {
 		return err
 	}

@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/syncthing/syncthing/internal/db"
+	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/semaphore"
 )
@@ -272,5 +274,55 @@ func TestPausedAnnouncementPreservesRevocationFence(t *testing.T) {
 	}
 	if _, _, err := g.AdmitAnnouncement(ctx, device1, "a", true); err == nil {
 		t.Fatal("broader pause open bypassed peer fence")
+	}
+}
+
+// The DB barrier seals admission exactly after deleting the old full index.
+type revokedIndexDB struct {
+	db.DB
+	afterDrop func()
+	updated   bool
+}
+
+func (d *revokedIndexDB) DropAllFiles(string, protocol.DeviceID) error               { d.afterDrop(); return nil }
+func (d *revokedIndexDB) GetDeviceSequence(string, protocol.DeviceID) (int64, error) { return 0, nil }
+func (d *revokedIndexDB) Update(_ string, _ protocol.DeviceID, _ []protocol.FileInfo) error {
+	d.updated = true
+	return nil
+}
+
+type indexPullRunner struct {
+	service
+	pulled bool
+}
+
+func (r *indexPullRunner) SchedulePull() { r.pulled = true }
+
+func TestFolderAccessFullIndexFinishesAfterSeal(t *testing.T) {
+	gate := new(FolderAccess)
+	scope, release, err := gate.Admit(context.Background(), device1, "one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	store := &revokedIndexDB{afterDrop: func() {
+		gate.Seal(device1, "one")
+		canceled, cancel := context.WithCancel(context.Background())
+		cancel()
+		if err := gate.Drain(canceled, device1, "one"); !errors.Is(err, context.Canceled) {
+			t.Fatalf("drained during replacement: %v", err)
+		}
+	}}
+	runner := &indexPullRunner{}
+	h := &indexHandler{conn: device1Conn, downloads: newDeviceDownloadState(), folder: "one", sdb: store, runner: runner, cond: sync.NewCond(new(sync.Mutex)), evLogger: events.NoopLogger}
+	if err := h.receive([]protocol.FileInfo{{Name: "fresh"}}, false, "index", 0, 0, scope); err != nil {
+		t.Fatal(err)
+	}
+	if !store.updated || !runner.pulled {
+		t.Fatal("full replacement abandoned after deleting old index")
+	}
+	release()
+	if err := gate.Drain(context.Background(), device1, "one"); err != nil {
+		t.Fatal(err)
 	}
 }

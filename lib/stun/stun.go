@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"slices"
 	"time"
 
 	"github.com/ccding/go-stun/stun"
@@ -42,6 +43,7 @@ const (
 )
 
 var errNotPunchable = errors.New("not punchable")
+var errServerRevoked = errors.New("STUN server revoked")
 
 type Subscriber interface {
 	OnNATTypeChanged(natType NATType)
@@ -98,6 +100,12 @@ func (s *Service) disabled() bool {
 	return opts.IsStunDisabled()
 }
 
+// A nil policy retains standalone STUN behavior. Explicit policies may revoke
+// an endpoint even while other endpoints remain enabled.
+func (s *Service) serverAllowed(addr string) bool {
+	return s.policy == nil || slices.Contains(s.servers(), addr)
+}
+
 func (s *Service) servers() []string {
 	if s.policy == nil {
 		return s.cfg.Options().StunServers()
@@ -137,10 +145,17 @@ func (s *Service) Serve(ctx context.Context) error {
 
 		l.Debugf("Starting stun for %s", s)
 
-		for _, addr := range s.servers() { //nolint:contextcheck // Synchronous configuration snapshot; the legacy StunServers logger accepts no context.
+		for _, addr := range s.servers() {
 			// This blocks until we hit an exit condition or there are
 			// issues with the STUN server.
-			if err := s.runStunForServer(ctx, addr); errors.Is(err, errNotPunchable) {
+			err := s.runStunForServer(ctx, addr)
+			if errors.Is(err, errServerRevoked) {
+				s.setNATType(NATUnknown)
+				s.setExternalAddress(nil, "")
+				timer.Reset(time.Millisecond)
+				goto disabled // Refresh the endpoint snapshot without the failure backoff.
+			}
+			if errors.Is(err, errNotPunchable) {
 				break // we will sleep for a while
 			}
 
@@ -169,6 +184,9 @@ func (s *Service) Serve(ctx context.Context) error {
 
 func (s *Service) runStunForServer(ctx context.Context, addr string) error {
 	l.Debugf("Running stun for %s via %s", s, addr)
+	if !s.serverAllowed(addr) {
+		return errServerRevoked
+	}
 
 	// Resolve the address, so that in case the server advertises two
 	// IPs, we always hit the same one, as otherwise, the mapping might
@@ -263,6 +281,9 @@ func (s *Service) stunKeepAlive(ctx context.Context, addr string, extAddr *Host)
 			return ctx.Err()
 		}
 
+		if !s.serverAllowed(addr) {
+			return errServerRevoked
+		}
 		if s.disabled() {
 			// Disabled, give up
 			l.Debugf("%s disabled, aborting stun ", s)

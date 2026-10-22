@@ -916,3 +916,92 @@ func TestPausedFolderAllowsSiblingUpdateAndReconnect(t *testing.T) {
 		})
 	}
 }
+
+func TestDownloadProgressAdmissionAndQueuedRevocation(t *testing.T) {
+	var output bytes.Buffer
+	c := newRawConnection(c0ID, bytes.NewReader(nil), &output, testutil.NoopCloser{}, nil, new(mockedConnectionInfo), CompressionNever)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	released := make(chan struct{})
+	c.folderAdmit = func(_ context.Context, folder string) (context.Context, func(), error) {
+		if folder == "denied" {
+			return nil, nil, context.Canceled
+		}
+		if folder == "revoked" {
+			return ctx, func() { close(released) }, nil
+		}
+		return context.Background(), func() {}, nil
+	}
+	c.DownloadProgress(context.Background(), &DownloadProgress{Folder: "denied"})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.DownloadProgress(context.Background(), &DownloadProgress{Folder: "revoked"})
+	}()
+	// Hold the message after enqueue, before the writer can serialize it.
+	msg := <-c.outbox
+	cancel()
+	select {
+	case <-released:
+		t.Fatal("released before queued work completed")
+	default:
+	}
+	c.outbox = make(chan asyncMessage, 1)
+	c.outbox <- msg
+	exited := make(chan struct{})
+	go func() { defer close(exited); c.writerLoop() }()
+	ccDone := make(chan struct{})
+	c.clusterConfigBox <- clusterConfigMessage{config: &ClusterConfig{}, done: ccDone}
+	<-ccDone
+	<-done
+	<-released
+	c.DownloadProgress(context.Background(), &DownloadProgress{Folder: "other"})
+	close(c.closed)
+	<-exited
+	reader := newRawConnection(c1ID, bytes.NewReader(output.Bytes()), io.Discard, testutil.NoopCloser{}, nil, new(mockedConnectionInfo), CompressionNever)
+	if _, err := reader.readMessage(make([]byte, 4)); err != nil {
+		t.Fatal(err)
+	}
+	message, err := reader.readMessage(make([]byte, 4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	progress, ok := message.(*bep.DownloadProgress)
+	if !ok || progress.Folder != "other" {
+		t.Fatalf("revoked metadata or sibling damage: %v", message)
+	}
+	if _, err := reader.readMessage(make([]byte, 4)); !errors.Is(err, io.EOF) {
+		t.Fatalf("extra wire message: %v", err)
+	}
+}
+
+func TestDownloadProgressBorrowEndsAfterWrite(t *testing.T) {
+	c := newRawConnection(c0ID, bytes.NewReader(nil), io.Discard, testutil.NoopCloser{}, nil, new(mockedConnectionInfo), CompressionNever)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	released := make(chan struct{})
+	c.folderAdmit = func(context.Context, string) (context.Context, func(), error) {
+		return ctx, func() { close(released) }, nil
+	}
+	exited := make(chan struct{})
+	go func() { defer close(exited); c.writerLoop() }()
+	ccDone := make(chan struct{})
+	c.clusterConfigBox <- clusterConfigMessage{config: &ClusterConfig{}, done: ccDone}
+	<-ccDone
+	writer := heldFolderWriter{make(chan struct{}, 1), make(chan struct{})}
+	c.cw = &countingWriter{Writer: writer}
+	done := make(chan struct{})
+	go func() { defer close(done); c.DownloadProgress(context.Background(), &DownloadProgress{Folder: "one"}) }()
+	<-writer.entered
+	cancel()
+	select {
+	case <-released:
+		t.Error("borrow released during active write")
+	default:
+	}
+	close(writer.resume)
+	<-done
+	<-released
+	close(c.closed)
+	<-exited
+}

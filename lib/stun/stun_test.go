@@ -8,6 +8,7 @@ package stun
 
 import (
 	"context"
+	"errors"
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/protocol"
@@ -49,5 +50,34 @@ func TestControlledPolicyIndependentOfRouterMapping(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("disabled STUN did not stop")
+	}
+}
+
+func TestKeepaliveRejectsReplacedServer(t *testing.T) {
+	cfg := config.Wrap("", config.Configuration{Options: config.OptionsConfiguration{StunKeepaliveMinS: 1, StunKeepaliveStartS: 1}}, protocol.LocalDeviceID, events.NoopLogger)
+	s := &Service{cfg: cfg, subscriber: policySubscriber{}}
+	current := []string{"127.0.0.1:3478"}
+	s.SetServerPolicy(func() []string { return current })
+	if !s.serverAllowed(current[0]) {
+		t.Fatal("initial endpoint rejected")
+	}
+	old := current[0]
+	current = []string{"127.0.0.1:3479"}
+	// A nil client makes any attempted network send fail immediately. The policy
+	// must stop the old keepalive even though STUN remains enabled via B.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.stunKeepAlive(ctx, old, nil); !errors.Is(err, errServerRevoked) {
+		t.Fatal(err)
+	}
+	if !s.serverAllowed(current[0]) || s.disabled() {
+		t.Fatal("replacement endpoint unavailable")
+	}
+	if err := s.runStunForServer(ctx, old); !errors.Is(err, errServerRevoked) {
+		t.Fatal(err)
+	}
+	s.SetServerPolicy(nil)
+	if !s.serverAllowed(old) {
+		t.Fatal("standalone behavior changed")
 	}
 }

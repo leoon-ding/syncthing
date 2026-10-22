@@ -390,9 +390,14 @@ func (s *service) connectionCheckEarly(remoteID protocol.DeviceID, c internalCon
 	}
 
 	currentConns := s.numConnectionsForDevice(cfg.DeviceID)
-	desiredConns := s.desiredConnectionsToDevice(cfg.DeviceID)
+	desiredConns := s.negotiatedConnectionsToDevice(cfg.DeviceID)
 	if !c.IsLocal() && s.singleWANConnection() {
-		desiredConns = 1
+		// LAN links do not consume the WAN slot. Keep the independent total
+		// connection/priority check below so the embedding policy cannot relax it.
+		count, worst := s.wanConnections(remoteID)
+		if count > 0 && c.priority+s.cfg.Options().ConnectionPriorityUpgradeThreshold >= worst {
+			return errDeviceAlreadyConnected
+		}
 	}
 	worstPrio := s.worstConnectionPriority(remoteID)
 	ourUpgradeThreshold := c.priority + s.cfg.Options().ConnectionPriorityUpgradeThreshold
@@ -474,7 +479,7 @@ func (s *service) handleHellos(ctx context.Context) error {
 		// boundary so simultaneous equal-priority dials cannot occupy the spare
 		// upgrade slot after both passed the pre-Hello check.
 		if !c.IsLocal() && s.singleWANConnection() {
-			if err := s.connectionCheckEarly(remoteID, c); err != nil { //nolint:contextcheck // Synchronous admission check only reaches the legacy context-free debug logger.
+			if err := s.connectionCheckEarly(remoteID, c); err != nil {
 				c.Close()
 				continue
 			}
@@ -1224,7 +1229,7 @@ func (s *service) dialWithAdmission(ctx context.Context, target dialTarget) (int
 	if s.options.BeforeDial != nil {
 		local := false
 		if uri, e := url.Parse(target.addr); e == nil && s.lanChecker != nil && uri.Hostname() != "" && (strings.HasPrefix(uri.Scheme, "tcp") || strings.HasPrefix(uri.Scheme, "quic")) {
-			local = s.lanChecker.isLANHost(uri.Hostname()) //nolint:contextcheck // Preserve the legacy resolver/address selection; this diagnostic reaches its context-free debug logger.
+			local = s.lanChecker.isLANHost(uri.Hostname())
 		}
 		scope, release, err := s.options.BeforeDial(ctx, target.deviceID, target.addr, local)
 		if release != nil {
@@ -1245,7 +1250,7 @@ func (s *service) dialWithAdmission(ctx context.Context, target dialTarget) (int
 	if err != nil {
 		return conn, err
 	}
-	if err := s.validateIdentity(conn, target.deviceID); err != nil { //nolint:contextcheck // Identity comparison only reaches the legacy context-free debug logger.
+	if err := s.validateIdentity(conn, target.deviceID); err != nil {
 		return internalConn{}, err
 	}
 	if err := ctx.Err(); err != nil {
@@ -1447,8 +1452,22 @@ func (s *service) singleWANConnection() bool {
 	return s.options.SingleWANConnection != nil && s.options.SingleWANConnection()
 }
 
+// wanConnections snapshots only links governed by the embedding WAN limit.
+func (s *service) wanConnections(id protocol.DeviceID) (int, int) {
+	s.connectionsMut.Lock()
+	defer s.connectionsMut.Unlock()
+	count, worst := 0, math.MinInt
+	for _, conn := range s.connections[id] {
+		if !conn.IsLocal() {
+			count++
+			worst = max(worst, conn.Priority())
+		}
+	}
+	return count, worst
+}
+
 func (s *service) desiredConnectionsToDevice(deviceID protocol.DeviceID) int {
-	cfg, ok := s.cfg.Device(deviceID)
+	_, ok := s.cfg.Device(deviceID)
 	if !ok {
 		// We want no connections to an unknown device.
 		return 0
@@ -1456,17 +1475,27 @@ func (s *service) desiredConnectionsToDevice(deviceID protocol.DeviceID) int {
 
 	if s.singleWANConnection() {
 		s.connectionsMut.Lock()
-		wan := false
+		wan, lan := false, false
 		for _, conn := range s.connections[deviceID] {
 			if !conn.IsLocal() {
 				wan = true
-				break
+			} else {
+				lan = true
 			}
 		}
 		s.connectionsMut.Unlock()
-		if wan {
+		if wan && !lan {
 			return 1
 		}
+	}
+
+	return s.negotiatedConnectionsToDevice(deviceID)
+}
+
+func (s *service) negotiatedConnectionsToDevice(deviceID protocol.DeviceID) int {
+	cfg, ok := s.cfg.Device(deviceID)
+	if !ok {
+		return 0
 	}
 
 	otherSide := s.wantConnectionsForDevice(deviceID)

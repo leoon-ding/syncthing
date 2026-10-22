@@ -533,6 +533,17 @@ func (c *rawConnection) Closed() <-chan struct{} {
 
 // DownloadProgress sends the progress updates for the files that are currently being downloaded.
 func (c *rawConnection) DownloadProgress(ctx context.Context, dp *DownloadProgress) {
+	if c.folderAdmit != nil {
+		scope, release, err := c.folderAdmit(ctx, dp.Folder)
+		if err != nil {
+			return
+		}
+		defer release()
+		done := make(chan struct{})
+		c.send(scope, dp.toWire(), done)
+		<-done
+		return
+	}
 	c.send(ctx, dp.toWire(), nil)
 }
 

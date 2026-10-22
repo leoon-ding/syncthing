@@ -223,3 +223,34 @@ func TestDialAdmissionPreservesLANClassification(t *testing.T) {
 		})
 	}
 }
+
+func TestNativeWANLimitExcludesLANConnections(t *testing.T) {
+	id := protocol.NewDeviceID([]byte("mixed-peer"))
+	cfg := config.New(protocol.LocalDeviceID)
+	cfg.Devices = append(cfg.Devices, config.DeviceConfiguration{DeviceID: id, RawNumConnections: 3})
+	s := &service{cfg: config.Wrap("", cfg, protocol.LocalDeviceID, events.NoopLogger)}
+	s.options.SingleWANConnection = func() bool { return true }
+	s.wantConnections = map[protocol.DeviceID]int{id: 3}
+	for _, tc := range []struct {
+		name     string
+		conns    []protocol.Connection
+		priority int
+		reject   bool
+	}{
+		{"LAN does not occupy WAN", []protocol.Connection{nativePolicyConnection{local: true, priority: 50}}, 50, false},
+		{"mixed duplicate WAN", []protocol.Connection{nativePolicyConnection{local: true, priority: 50}, nativePolicyConnection{priority: 50}}, 50, true},
+		{"mixed WAN upgrade", []protocol.Connection{nativePolicyConnection{local: true, priority: 50}, nativePolicyConnection{priority: 50}}, 30, false},
+		{"total cap preserved", []protocol.Connection{nativePolicyConnection{local: true, priority: 50}, nativePolicyConnection{local: true, priority: 50}, nativePolicyConnection{local: true, priority: 50}}, 50, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s.connections = map[protocol.DeviceID][]protocol.Connection{id: tc.conns}
+			err := s.connectionCheckEarly(id, internalConn{priority: tc.priority})
+			if errors.Is(err, errDeviceAlreadyConnected) != tc.reject {
+				t.Fatalf("admission: %v", err)
+			}
+			if s.desiredConnectionsToDevice(id) != 3 {
+				t.Fatal("WAN policy reduced LAN connection target")
+			}
+		})
+	}
+}
