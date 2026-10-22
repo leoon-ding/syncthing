@@ -5,11 +5,14 @@ package client
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/url"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -73,7 +76,8 @@ func (c *staticClient) serveWithRenewal(ctx context.Context, renew <-chan time.T
 	l.Debugln(c, "connected", c.conn.RemoteAddr())
 	defer c.disconnect()
 
-	if err := c.join(ctx); err != nil {
+	expires, err := c.join(ctx)
+	if err != nil {
 		l.Debugf("Could not join relay %s: %s", c.uri, err)
 		return err
 	}
@@ -97,10 +101,15 @@ func (c *staticClient) serveWithRenewal(ctx context.Context, renew <-chan time.T
 
 	timeout := time.NewTimer(c.messageTimeout)
 	defer timeout.Stop()
+	var renewal *time.Timer
 	if c.permit != nil && renew == nil {
-		ticker := time.NewTicker(2 * time.Minute)
-		defer ticker.Stop()
-		renew = ticker.C
+		delay, err := permitRenewalDelay(expires, time.Now())
+		if err != nil {
+			return err
+		}
+		renewal = time.NewTimer(delay)
+		defer renewal.Stop()
+		renew = renewal.C
 	}
 
 	for {
@@ -143,7 +152,14 @@ func (c *staticClient) serveWithRenewal(ctx context.Context, renew <-chan time.T
 			}
 
 		case <-renew:
-			token, err := c.permit(ctx)
+			// Do not let a stalled issuer outlive the current registration.
+			renewCtx, cancel := context.WithDeadline(ctx, expires)
+			token, err := c.permit(renewCtx)
+			cancel()
+			if err != nil {
+				return err
+			}
+			nextExpiry, err := privatePermitExpiry(token, time.Now())
 			if err != nil {
 				return err
 			}
@@ -155,6 +171,14 @@ func (c *staticClient) serveWithRenewal(ctx context.Context, renew <-chan time.T
 			}
 			if err := c.conn.SetWriteDeadline(time.Time{}); err != nil {
 				return err
+			}
+			expires = nextExpiry
+			if renewal != nil {
+				delay, err := permitRenewalDelay(expires, time.Now())
+				if err != nil {
+					return err
+				}
+				renewal.Reset(delay)
 			}
 		case <-ctx.Done():
 			l.Debugln(c, "stopping")
@@ -227,38 +251,43 @@ func (c *staticClient) disconnect() {
 	c.conn.Close()
 }
 
-func (c *staticClient) join(ctx context.Context) error {
+func (c *staticClient) join(ctx context.Context) (time.Time, error) {
+	var expires time.Time
 	var request any = protocol.JoinRelayRequest{Token: c.token}
 	if c.permit != nil {
 		token, err := c.permit(ctx)
 		if err != nil {
-			return err
+			return time.Time{}, err
+		}
+		expires, err = privatePermitExpiry(token, time.Now())
+		if err != nil {
+			return time.Time{}, err
 		}
 		request = protocol.PrivateJoinRequest{Permit: token}
 	}
 	if err := protocol.WriteMessage(c.conn, request); err != nil {
-		return err
+		return time.Time{}, err
 	}
 
 	message, err := protocol.ReadMessage(c.conn)
 	if err != nil {
-		return err
+		return time.Time{}, err
 	}
 
 	switch msg := message.(type) {
 	case protocol.Response:
 		if msg.Code != 0 {
-			return &incorrectResponseCodeErr{msg.Code, msg.Message}
+			return time.Time{}, &incorrectResponseCodeErr{msg.Code, msg.Message}
 		}
 
 	case protocol.RelayFull:
-		return errors.New("relay full")
+		return time.Time{}, errors.New("relay full")
 
 	default:
-		return fmt.Errorf("protocol error: expecting response got %v", msg)
+		return time.Time{}, fmt.Errorf("protocol error: expecting response got %v", msg)
 	}
 
-	return nil
+	return expires, nil
 }
 
 func performHandshakeAndValidation(conn *tls.Conn, uri *url.URL) error {
@@ -313,4 +342,35 @@ func messageReader(ctx context.Context, conn net.Conn, messages chan<- any, erro
 			return
 		}
 	}
+}
+
+// The issuer callback supplies the token. Its expiry is only a scheduling hint;
+// authenticity, identity and permission are still verified by the relay.
+func privatePermitExpiry(token protocol.PermitToken, now time.Time) (time.Time, error) {
+	if len(token) > 4096 {
+		return time.Time{}, protocol.ErrPermit
+	}
+	payload, signature, ok := strings.Cut(string(token), ".")
+	if !ok || signature == "" {
+		return time.Time{}, protocol.ErrPermit
+	}
+	raw, err := base64.RawURLEncoding.Strict().DecodeString(payload)
+	if err != nil {
+		return time.Time{}, protocol.ErrPermit
+	}
+	var permit protocol.Permit
+	if json.Unmarshal(raw, &permit) != nil || permit.Purpose != "join" || permit.IssuedAt <= 0 || permit.IssuedAt > now.Unix() || permit.ExpiresAt <= now.Unix() || permit.ExpiresAt <= permit.IssuedAt || permit.ExpiresAt-permit.IssuedAt > 300 {
+		return time.Time{}, protocol.ErrPermit
+	}
+	return time.Unix(permit.ExpiresAt, 0), nil
+}
+
+func permitRenewalDelay(expires, now time.Time) (time.Duration, error) {
+	remaining := expires.Sub(now)
+	if remaining <= 0 {
+		return 0, protocol.ErrPermit
+	}
+	// Reserve half of a short lease, or 30 seconds for a long lease. Recompute
+	// from the actual remaining lifetime after every join/renewal write.
+	return remaining - min(remaining/2, 30*time.Second), nil
 }
