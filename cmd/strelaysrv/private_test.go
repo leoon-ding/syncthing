@@ -12,6 +12,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	native "github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/relay/client"
@@ -408,4 +409,83 @@ func TestPrivateRelayDefaultCapacityAndRecovery(t *testing.T) {
 		t.Fatal("allocation capacity did not recover", err)
 	}
 	sessions = append(sessions, s)
+}
+
+// A non-TCP connection exercises socket-option failure after quota admission.
+type privateOptionFailureConn struct {
+	net.Conn
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (c *privateOptionFailureConn) RemoteAddr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}
+}
+func (c *privateOptionFailureConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return c.Conn.Close()
+}
+
+type privateOneListener struct {
+	conn net.Conn
+	next chan struct{}
+}
+
+func (l *privateOneListener) Accept() (net.Conn, error) {
+	if l.conn != nil {
+		c := l.conn
+		l.conn = nil
+		return c, nil
+	}
+	<-l.next
+	return nil, net.ErrClosed
+}
+func (l *privateOneListener) Close() error   { close(l.next); return nil }
+func (l *privateOneListener) Addr() net.Addr { return &net.TCPAddr{} }
+func TestPrivateSocketOptionFailureReleasesQuota(t *testing.T) {
+	pub, _, _ := ed25519.GenerateKey(rand.Reader)
+	p, err := newPrivateRelay(privateRelayConfig{Issuer: "discovery", Keys: map[string][]byte{"current": pub}}, native.NewDeviceID([]byte("relay")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	left, right := net.Pipe()
+	defer right.Close()
+	c := &privateOptionFailureConn{Conn: left, closed: make(chan struct{})}
+	l := &privateOneListener{conn: c, next: make(chan struct{})}
+	done := make(chan struct{})
+	go func() { p.listen(l, &tls.Config{}); close(done) }()
+	select {
+	case <-c.closed:
+	case <-time.After(5 * time.Second):
+		l.Close()
+		t.Fatal("option failure did not close connection")
+	}
+	l.Close()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("listener did not drain")
+	}
+	if len(p.handshakes) != 0 {
+		t.Fatal("handshake quota leaked")
+	}
+	select {
+	case p.handshakes <- struct{}{}:
+		<-p.handshakes
+	default:
+		t.Fatal("quota not reusable")
+	}
+}
+func TestPrivateHandshakeDeadlineReleasesBorrow(t *testing.T) {
+	left, right := net.Pipe()
+	defer right.Close()
+	releases := 0
+	p := &privateRelay{}
+	p.handle(left, &tls.Config{}, func() { releases++ }, time.Now().Add(-time.Second))
+	if releases != 1 {
+		t.Fatalf("release count %d", releases)
+	}
+	if _, err := right.Write([]byte{1}); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("socket not closed: %v", err)
+	}
 }

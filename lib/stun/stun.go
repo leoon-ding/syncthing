@@ -137,7 +137,7 @@ func (s *Service) Serve(ctx context.Context) error {
 
 		l.Debugf("Starting stun for %s", s)
 
-		for _, addr := range s.servers() {
+		for _, addr := range s.servers() { //nolint:contextcheck // Synchronous configuration snapshot; the legacy StunServers logger accepts no context.
 			// This blocks until we hit an exit condition or there are
 			// issues with the STUN server.
 			if err := s.runStunForServer(ctx, addr); errors.Is(err, errNotPunchable) {

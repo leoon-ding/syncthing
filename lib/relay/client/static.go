@@ -87,7 +87,7 @@ func (c *staticClient) serveWithRenewal(ctx context.Context, renew <-chan time.T
 
 	slog.InfoContext(ctx, "Joined relay", slogutil.URI(fmt.Sprintf("%s://%s", c.uri.Scheme, c.uri.Host)))
 
-	messages := make(chan interface{})
+	messages := make(chan any)
 	errorsc := make(chan error, 1)
 
 	readerCtx, cancelReader := context.WithCancel(ctx)
@@ -228,7 +228,7 @@ func (c *staticClient) disconnect() {
 }
 
 func (c *staticClient) join(ctx context.Context) error {
-	var request interface{} = protocol.JoinRelayRequest{Token: c.token}
+	var request any = protocol.JoinRelayRequest{Token: c.token}
 	if c.permit != nil {
 		token, err := c.permit(ctx)
 		if err != nil {
@@ -264,6 +264,7 @@ func (c *staticClient) join(ctx context.Context) error {
 func performHandshakeAndValidation(conn *tls.Conn, uri *url.URL) error {
 	return performHandshakeProtocol(conn, uri, protocol.ProtocolName)
 }
+
 func performHandshakeProtocol(conn *tls.Conn, uri *url.URL, alpn string) error {
 	if alpn == protocol.ControlledProtocolName && uri.Query().Get("id") == "" {
 		return errors.New("private relay requires identity pin")
@@ -299,7 +300,7 @@ func performHandshakeProtocol(conn *tls.Conn, uri *url.URL, alpn string) error {
 	return nil
 }
 
-func messageReader(ctx context.Context, conn net.Conn, messages chan<- interface{}, errors chan<- error) {
+func messageReader(ctx context.Context, conn net.Conn, messages chan<- any, errors chan<- error) {
 	for {
 		msg, err := protocol.ReadMessage(conn)
 		if err != nil {

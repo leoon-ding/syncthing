@@ -8,6 +8,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
@@ -38,7 +39,7 @@ type privateDevice struct {
 }
 type privateRegistration struct {
 	expires int64
-	out     chan interface{}
+	out     chan any
 	limiter *rate.Limiter
 }
 type privateAllocation struct {
@@ -101,6 +102,7 @@ func newPrivateRelay(config privateRelayConfig, id native.DeviceID) (*privateRel
 	}
 	return &privateRelay{issuer: config.Issuer, audience: id.String(), boot: hex.EncodeToString(b), keys: keys, keyNotAfter: expiry, registrations: map[native.DeviceID]*privateRegistration{}, devices: map[native.DeviceID]*privateDevice{}, sources: map[string]*privateDevice{}, allocations: map[string]*privateAllocation{}, counts: map[native.DeviceID]int{}, now: time.Now, handshakes: make(chan struct{}, 512), admission: rate.NewLimiter(200, 512)}, nil
 }
+
 func (p *privateRelay) verify(token protocol.PermitToken, id native.DeviceID, use string) (protocol.Permit, error) {
 	// The target is extracted only to supply an expected field to the verifier;
 	// no existence lookup is performed until the full signature is verified.
@@ -129,7 +131,8 @@ func (p *privateRelay) verify(token protocol.PermitToken, id native.DeviceID, us
 	}
 	return protocol.VerifyPermit(token, keys, p.issuer, p.audience, p.boot, use, id.String(), hint.Target, p.now())
 }
-func (p *privateRelay) register(id native.DeviceID, token protocol.PermitToken, out chan interface{}) (time.Time, error) {
+
+func (p *privateRelay) register(id native.DeviceID, token protocol.PermitToken, out chan any) (time.Time, error) {
 	grant, e := p.verify(token, id, "join")
 	if e != nil {
 		return time.Time{}, protocol.ErrPermit
@@ -164,14 +167,16 @@ func (p *privateRelay) register(id native.DeviceID, token protocol.PermitToken, 
 	d.retain = now.Add(300 * time.Second).Unix()
 	return time.Unix(grant.ExpiresAt, 0), nil
 }
-func (p *privateRelay) unregister(id native.DeviceID, out chan interface{}) {
+
+func (p *privateRelay) unregister(id native.DeviceID, out chan any) {
 	p.mu.Lock()
 	if r := p.registrations[id]; r != nil && r.out == out {
 		delete(p.registrations, id)
 	}
 	p.mu.Unlock()
 }
-func (p *privateRelay) allocate(id native.DeviceID, token protocol.PermitToken) (*session, chan interface{}, bool, error) {
+
+func (p *privateRelay) allocate(id native.DeviceID, token protocol.PermitToken) (*session, chan any, bool, error) {
 	grant, e := p.verify(token, id, "connect")
 	if e != nil {
 		return nil, nil, false, protocol.ErrPermit
@@ -230,13 +235,16 @@ func (p *privateRelay) allocate(id native.DeviceID, token protocol.PermitToken) 
 	go ses.Serve()
 	return ses, destination.out, true, nil
 }
+
 func (p *privateRelay) handle(tcp net.Conn, config *tls.Config, releaseHandshake func(), deadline time.Time) {
 	var released sync.Once
 	release := func() { released.Do(releaseHandshake) }
 	defer release()
 	defer tcp.Close()
 	conn := tls.Server(tcp, config)
-	if conn.SetDeadline(deadline) != nil || conn.Handshake() != nil {
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+	if conn.SetDeadline(deadline) != nil || conn.HandshakeContext(ctx) != nil {
 		return
 	}
 	cs := conn.ConnectionState()
@@ -244,9 +252,9 @@ func (p *privateRelay) handle(tcp net.Conn, config *tls.Config, releaseHandshake
 		return
 	}
 	id := native.NewDeviceID(cs.PeerCertificates[0].Raw)
-	out := make(chan interface{})
+	out := make(chan any)
 	defer p.unregister(id, out)
-	messages := make(chan interface{})
+	messages := make(chan any)
 	errs := make(chan error, 1)
 	readerDone := make(chan struct{})
 	readerStop := make(chan struct{})
@@ -279,7 +287,9 @@ func (p *privateRelay) handle(tcp net.Conn, config *tls.Config, releaseHandshake
 		select {
 		case <-expiry.C:
 			return
-		case <-errs:
+		case err := <-errs:
+			// Read errors end this session; deferred close joins the reader.
+			_ = err
 			return
 		case <-ping.C:
 			if !joined {
@@ -383,10 +393,12 @@ func (p *privateRelay) admitSource(address net.Addr) bool {
 
 type privateBufferedConn struct {
 	net.Conn
+
 	reader io.Reader
 }
 
 func (c *privateBufferedConn) Read(b []byte) (int, error) { return c.reader.Read(b) }
+
 func (p *privateRelay) listen(listener net.Listener, config *tls.Config) {
 	var workers sync.WaitGroup
 	var mu sync.Mutex
@@ -443,7 +455,10 @@ func (p *privateRelay) listen(listener net.Listener, config *tls.Config) {
 			var once sync.Once
 			release := func() { once.Do(func() { <-p.handshakes }) }
 			defer release()
-			setTCPOptions(conn)
+			if err := setTCPOptions(conn); err != nil {
+				conn.Close()
+				return
+			}
 			deadline := time.Now().Add(10 * time.Second)
 			if conn.SetReadDeadline(deadline) != nil {
 				conn.Close()

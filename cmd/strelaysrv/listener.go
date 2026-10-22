@@ -309,6 +309,7 @@ func protocolConnectionHandler(tcpConn net.Conn, config *tls.Config, token strin
 }
 
 func sessionConnectionHandler(conn net.Conn) { sessionConnectionHandlerTimeout(conn, messageTimeout) }
+
 func sessionConnectionHandlerTimeout(conn net.Conn, timeout time.Duration) {
 	handedOff := false
 	defer func() {

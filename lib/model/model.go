@@ -17,6 +17,7 @@ import (
 	"io"
 	"iter"
 	"log/slog"
+	"maps"
 	"net"
 	"os"
 	"path/filepath"
@@ -1237,7 +1238,7 @@ func (m *model) ClusterConfig(conn protocol.Connection, cm *protocol.ClusterConf
 				continue
 			}
 			defer release()
-			scopes[folder.ID] = scope
+			scopes[folder.ID] = scope //nolint:fatcontext // Independent folder borrows, not a parent chain; retain all until the snapshot is applied.
 			if scope.Err() == nil {
 				snapshot.Folders = append(snapshot.Folders, folder)
 			} else {
@@ -1565,9 +1566,7 @@ func (m *model) ccHandleFolders(folders []protocol.Folder, deviceCfg config.Devi
 	// existing metadata only; never create a handler or authorize data from it.
 	// Configuration removal and the per-request fence still revoke access.
 	retained := make(map[string]remoteFolderState, len(seenFolders)+len(withheld))
-	for id, state := range seenFolders {
-		retained[id] = state
-	}
+	maps.Copy(retained, seenFolders)
 	for id := range withheld {
 		retained[id] = remoteFolderUnknown
 	}
@@ -2210,6 +2209,7 @@ func newLimitedRequestResponse(size int, limiters ...*semaphore.Semaphore) *requ
 	res, _ := newLimitedRequestResponseContext(context.Background(), size, limiters...)
 	return res
 }
+
 func newLimitedRequestResponseContext(ctx context.Context, size int, limiters ...*semaphore.Semaphore) (*requestResponse, error) {
 	multi := semaphore.MultiSemaphore(limiters)
 	if err := multi.TakeWithContext(ctx, size); err != nil {

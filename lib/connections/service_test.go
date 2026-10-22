@@ -184,3 +184,42 @@ func TestNativeWANConnectionTargetAndHandoff(t *testing.T) {
 		t.Fatal("unknown peer target")
 	}
 }
+
+// Admission consumes the existing LAN classification without replacing the
+// resolver or changing the native dialer's address-selection policy.
+func TestDialAdmissionPreservesLANClassification(t *testing.T) {
+	cfg := config.Wrap("/dev/null", config.Configuration{Options: config.OptionsConfiguration{
+		AlwaysLocalNets: []string{"10.20.30.0/24", "fd00:1234::/64"},
+	}}, protocol.LocalDeviceID, events.NoopLogger)
+	for _, tc := range []struct {
+		address string
+		local   bool
+	}{
+		{"tcp://127.0.0.1:22000", true},
+		{"tcp://[::1]:22000", true},
+		{"quic://10.20.30.40:22000", true},
+		{"quic://[fd00:1234::1]:22000", true},
+		{"tcp://192.0.2.1:22000", false},
+		{"tcp://[2001:db8::1]:22000", false},
+		{"private-relay://127.0.0.1:22067", false},
+	} {
+		t.Run(tc.address, func(t *testing.T) {
+			denied := errors.New("stop after admission observation")
+			peer := protocol.NewDeviceID([]byte("peer"))
+			calls, releases := 0, 0
+			d := &admissionTestDialer{}
+			s := &service{lanChecker: &lanChecker{cfg: cfg}}
+			s.options.BeforeDial = func(ctx context.Context, id protocol.DeviceID, address string, local bool) (context.Context, func(), error) {
+				calls++
+				if id != peer || address != tc.address || local != tc.local {
+					t.Errorf("unexpected admission input: %v %s %v", id, address, local)
+				}
+				return nil, func() { releases++ }, denied
+			}
+			_, err := s.dialWithAdmission(context.Background(), dialTarget{deviceID: peer, addr: tc.address, dialer: d})
+			if !errors.Is(err, denied) || calls != 1 || releases != 1 || d.calls != 0 {
+				t.Fatalf("err=%v calls=%d releases=%d dials=%d", err, calls, releases, d.calls)
+			}
+		})
+	}
+}

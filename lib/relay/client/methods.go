@@ -39,7 +39,8 @@ func GetPrivateInvitationFromRelay(ctx context.Context, uri *url.URL, certs []tl
 	}
 	return getInvitation(ctx, uri, certs, timeout, protocol.PrivateConnectRequest{Permit: token}, protocol.ControlledProtocolName)
 }
-func getInvitation(ctx context.Context, uri *url.URL, certs []tls.Certificate, timeout time.Duration, request interface{}, alpn string) (protocol.SessionInvitation, error) {
+
+func getInvitation(ctx context.Context, uri *url.URL, certs []tls.Certificate, timeout time.Duration, request any, alpn string) (protocol.SessionInvitation, error) {
 	if uri.Scheme != "relay" {
 		return protocol.SessionInvitation{}, fmt.Errorf("unsupported relay scheme: %v", uri.Scheme)
 	}

@@ -58,15 +58,17 @@ func permitID(v string) bool {
 	}
 	return true
 }
+
 func permitDevice(v string) bool {
 	id, err := native.DeviceIDFromString(v)
 	return err == nil && id.String() == v
 }
+
 func (p Permit) valid(now time.Time) bool {
 	if p.Version != 1 || len(p.KeyID) == 0 || len(p.KeyID) > 64 || len(p.Issuer) == 0 || len(p.Issuer) > 128 || !permitDevice(p.Audience) || !permitDevice(p.Subject) || !permitID(p.Boot) || !permitID(p.ID) {
 		return false
 	}
-	maxTTL := int64(0)
+	var maxTTL int64
 	switch p.Purpose {
 	case "join":
 		if p.Target != "" {
@@ -141,8 +143,10 @@ const (
 	messageTypePrivateConnect int32 = 257
 )
 
-type PrivateJoinRequest struct{ Permit PermitToken }
-type PrivateConnectRequest struct{ Permit PermitToken }
+type (
+	PrivateJoinRequest    struct{ Permit PermitToken }
+	PrivateConnectRequest struct{ Permit PermitToken }
+)
 
 func (PrivateJoinRequest) String() string      { return "private relay join [redacted]" }
 func (PrivateJoinRequest) GoString() string    { return "private relay join [redacted]" }

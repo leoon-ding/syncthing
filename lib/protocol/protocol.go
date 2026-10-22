@@ -198,7 +198,7 @@ type asyncResult struct {
 }
 
 type asyncMessage struct {
-	ctx  context.Context
+	ctx  context.Context //nolint:containedctx // Queue retains the admission scope until write completion or cancellation.
 	msg  proto.Message
 	done chan struct{} // done closes when we're done sending the message
 }

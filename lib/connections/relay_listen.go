@@ -222,7 +222,7 @@ func (relayListenerFactory) Valid(cfg config.Configuration) error {
 func (s *service) servePrivateRelay(ctx context.Context) error {
 	if s.networkCtx != nil {
 		scope, cancel := context.WithCancel(ctx)
-		stop := context.AfterFunc(s.networkCtx, cancel)
+		stop := context.AfterFunc(s.networkCtx, cancel) //nolint:contextcheck // Merge the run fence with the caller-derived scope; neither owner may outlive shutdown.
 		defer stop()
 		defer cancel()
 		ctx = scope

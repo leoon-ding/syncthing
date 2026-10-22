@@ -182,7 +182,7 @@ type connWithHello struct {
 }
 
 type service struct {
-	networkCtx    context.Context
+	networkCtx    context.Context //nolint:containedctx // Run-owned cancellation fence, sealed by Quiesce before draining connections.
 	networkCancel context.CancelFunc
 	admissionMu   sync.Mutex
 	quiescing     bool
@@ -474,7 +474,7 @@ func (s *service) handleHellos(ctx context.Context) error {
 		// boundary so simultaneous equal-priority dials cannot occupy the spare
 		// upgrade slot after both passed the pre-Hello check.
 		if !c.IsLocal() && s.singleWANConnection() {
-			if err := s.connectionCheckEarly(remoteID, c); err != nil {
+			if err := s.connectionCheckEarly(remoteID, c); err != nil { //nolint:contextcheck // Synchronous admission check only reaches the legacy context-free debug logger.
 				c.Close()
 				continue
 			}
@@ -1224,7 +1224,7 @@ func (s *service) dialWithAdmission(ctx context.Context, target dialTarget) (int
 	if s.options.BeforeDial != nil {
 		local := false
 		if uri, e := url.Parse(target.addr); e == nil && s.lanChecker != nil && uri.Hostname() != "" && (strings.HasPrefix(uri.Scheme, "tcp") || strings.HasPrefix(uri.Scheme, "quic")) {
-			local = s.lanChecker.isLANHost(uri.Hostname())
+			local = s.lanChecker.isLANHost(uri.Hostname()) //nolint:contextcheck // Preserve the legacy resolver/address selection; this diagnostic reaches its context-free debug logger.
 		}
 		scope, release, err := s.options.BeforeDial(ctx, target.deviceID, target.addr, local)
 		if release != nil {
@@ -1245,7 +1245,7 @@ func (s *service) dialWithAdmission(ctx context.Context, target dialTarget) (int
 	if err != nil {
 		return conn, err
 	}
-	if err := s.validateIdentity(conn, target.deviceID); err != nil {
+	if err := s.validateIdentity(conn, target.deviceID); err != nil { //nolint:contextcheck // Identity comparison only reaches the legacy context-free debug logger.
 		return internalConn{}, err
 	}
 	if err := ctx.Err(); err != nil {

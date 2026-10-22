@@ -707,6 +707,7 @@ func (r *folderKeyRegistry) setPasswords(keyGen *KeyGenerator, passwords map[str
 // Retain the source admission and byte budget until encrypted bytes are sent.
 type retainedEncryptedResponse struct {
 	RequestResponse
+
 	data []byte
 }
 

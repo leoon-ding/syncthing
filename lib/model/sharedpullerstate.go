@@ -460,7 +460,7 @@ func blocksToSize(blocks, blocksInFile, blockSize int, fileSize int64) int64 {
 }
 
 type pullSource struct {
-	ctx     context.Context
+	ctx     context.Context //nolint:containedctx // Source admission survives all blocks through rename and database flush.
 	release func()
 }
 
@@ -488,6 +488,7 @@ func (s *sharedPullerState) admitSource(parent context.Context, g *FolderAccess,
 	s.sources[device] = pullSource{ctx, release}
 	return ctx, nil
 }
+
 func (s *sharedPullerState) sourceError() error {
 	s.mut.RLock()
 	defer s.mut.RUnlock()
@@ -498,6 +499,7 @@ func (s *sharedPullerState) sourceError() error {
 	}
 	return nil
 }
+
 func (s *sharedPullerState) releaseSources() {
 	s.mut.Lock()
 	sources := s.sources

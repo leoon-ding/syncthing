@@ -10,7 +10,6 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
-	relayprotocol "github.com/syncthing/syncthing/lib/relay/protocol"
 	"net/url"
 	"time"
 
@@ -19,6 +18,7 @@ import (
 	"github.com/syncthing/syncthing/lib/dialer"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/relay/client"
+	relayprotocol "github.com/syncthing/syncthing/lib/relay/protocol"
 )
 
 func init() {
@@ -93,6 +93,10 @@ func (d *relayDialer) Priority(_ string) int {
 type relayDialerFactory struct{}
 
 func (relayDialerFactory) New(opts config.OptionsConfiguration, tlsCfg *tls.Config, _ *registry.Registry, _ *lanChecker) genericDialer {
+	return newRelayDialer(opts, tlsCfg)
+}
+
+func newRelayDialer(opts config.OptionsConfiguration, tlsCfg *tls.Config) *relayDialer {
 	return &relayDialer{commonDialer: commonDialer{
 		trafficClass:      opts.TrafficClass,
 		reconnectInterval: time.Duration(opts.RelayReconnectIntervalM) * time.Minute,
@@ -120,8 +124,8 @@ func (relayDialerFactory) String() string {
 type privateRelayDialerFactory struct{ relayDialerFactory }
 
 func (privateRelayDialerFactory) Valid(config.Configuration) error { return nil }
-func (privateRelayDialerFactory) New(opts config.OptionsConfiguration, tlsCfg *tls.Config, registry *registry.Registry, checker *lanChecker) genericDialer {
-	d := relayDialerFactory{}.New(opts, tlsCfg, registry, checker).(*relayDialer)
+func (privateRelayDialerFactory) New(opts config.OptionsConfiguration, tlsCfg *tls.Config, _ *registry.Registry, checker *lanChecker) genericDialer {
+	d := newRelayDialer(opts, tlsCfg)
 	// Short grants must not inherit the public relay reconnect delay in minutes.
 	d.reconnectInterval = 30 * time.Second
 	if checker != nil {

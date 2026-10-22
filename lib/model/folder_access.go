@@ -46,9 +46,11 @@ func (g *FolderAccess) initLocked() {
 		g.reopened = make(chan struct{}, 1)
 	}
 }
+
 func (s folderScope) matches(v folderScope) bool {
 	return (s.device == protocol.EmptyDeviceID || s.device == v.device) && (s.folder == "" || s.folder == v.folder)
 }
+
 func (g *FolderAccess) Admit(parent context.Context, device protocol.DeviceID, folder string) (context.Context, func(), error) {
 	return g.admit(parent, device, folder, false, false)
 }
@@ -112,6 +114,7 @@ func (g *FolderAccess) Seal(device protocol.DeviceID, folder string) {
 		}
 	}
 }
+
 func (g *FolderAccess) Drain(ctx context.Context, device protocol.DeviceID, folder string) error {
 	if g == nil {
 		return nil
@@ -169,7 +172,8 @@ func (g *FolderAccess) Open(device protocol.DeviceID, folder string) error {
 
 type admittedResponse struct {
 	protocol.RequestResponse
-	ctx     context.Context
+
+	ctx     context.Context //nolint:containedctx // Admission must survive until response Close releases the send borrow.
 	release func()
 	once    sync.Once
 }
