@@ -93,9 +93,15 @@ func New(cfg config.Wrapper, subscriber Subscriber, conn net.PacketConn) *Servic
 func (s *Service) SetServerPolicy(policy func() []string) { s.policy = policy }
 
 func (s *Service) disabled() bool {
+	return s.disabledForServers(s.servers())
+}
+
+// Use the same validated snapshot for the round's enabled decision and iteration.
+// Access and keepalive checks still read the live policy independently.
+func (s *Service) disabledForServers(servers []string) bool {
 	opts := s.cfg.Options()
 	if s.policy != nil {
-		return opts.StunKeepaliveMinS < 1 || opts.StunKeepaliveStartS < 1 || len(s.policy()) == 0
+		return opts.StunKeepaliveMinS < 1 || opts.StunKeepaliveStartS < 1 || len(servers) == 0
 	}
 	return opts.IsStunDisabled()
 }
@@ -138,14 +144,15 @@ func (s *Service) Serve(ctx context.Context) error {
 		case <-timer.C:
 		}
 
-		if s.disabled() {
+		servers := s.servers()
+		if s.disabledForServers(servers) {
 			timer.Reset(time.Second)
 			continue
 		}
 
 		l.Debugf("Starting stun for %s", s)
 
-		for _, addr := range s.servers() {
+		for _, addr := range servers {
 			// This blocks until we hit an exit condition or there are
 			// issues with the STUN server.
 			err := s.runStunForServer(ctx, addr)

@@ -81,3 +81,61 @@ func TestKeepaliveRejectsReplacedServer(t *testing.T) {
 		t.Fatal("standalone behavior changed")
 	}
 }
+
+func TestPolicySnapshotClearRestoreAndReplace(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		snapshots [][]string
+	}{
+		{"clear and replace", [][]string{{"127.0.0.1:3478"}, nil, {"127.0.0.1:3479"}, nil}},
+		{"empty then restore", [][]string{nil, {"127.0.0.1:3478"}, nil}},
+		{"invalid then restore", [][]string{{"default", "missing-port"}, {"127.0.0.1:3478"}, nil}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.Wrap("", config.Configuration{Options: config.OptionsConfiguration{StunKeepaliveMinS: 1, StunKeepaliveStartS: 1}}, protocol.LocalDeviceID, events.NoopLogger)
+			s := &Service{cfg: cfg, subscriber: policySubscriber{}}
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			reads := 0
+			s.SetServerPolicy(func() []string {
+				if reads == len(tc.snapshots) {
+					cancel()
+					return nil
+				}
+				result := tc.snapshots[reads]
+				reads++
+				return result
+			})
+			// Each nonempty round snapshot is revoked on the access check. A nil
+			// client proves that no stale endpoint reaches a network operation.
+			if err := s.Serve(ctx); !errors.Is(err, context.Canceled) {
+				t.Fatalf("policy refresh stalled: reads=%d err=%v", reads, err)
+			}
+			if reads != len(tc.snapshots) {
+				t.Fatalf("policy snapshots consumed=%d want=%d", reads, len(tc.snapshots))
+			}
+		})
+	}
+}
+
+func TestKeepaliveRejectsClearedPolicyAndAllowsRestore(t *testing.T) {
+	cfg := config.Wrap("", config.Configuration{Options: config.OptionsConfiguration{StunKeepaliveMinS: 1, StunKeepaliveStartS: 1}}, protocol.LocalDeviceID, events.NoopLogger)
+	s := &Service{cfg: cfg, subscriber: policySubscriber{}}
+	const endpoint = "127.0.0.1:3478"
+	current := []string{endpoint}
+	s.SetServerPolicy(func() []string { return current })
+	current = nil
+	if !s.disabled() {
+		t.Fatal("cleared policy enabled")
+	}
+	if err := s.stunKeepAlive(context.Background(), endpoint, nil); !errors.Is(err, errServerRevoked) {
+		t.Fatal(err)
+	}
+	if err := s.runStunForServer(context.Background(), endpoint); !errors.Is(err, errServerRevoked) {
+		t.Fatal(err)
+	}
+	current = []string{endpoint}
+	if s.disabled() || !s.serverAllowed(endpoint) {
+		t.Fatal("restored endpoint rejected")
+	}
+}
