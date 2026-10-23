@@ -1005,3 +1005,123 @@ func TestDownloadProgressBorrowEndsAfterWrite(t *testing.T) {
 	close(c.closed)
 	<-exited
 }
+
+func TestClusterConfigUnsentCancellationReleasesWholeSnapshot(t *testing.T) {
+	for _, canceledFolder := range []string{"A", "B"} {
+		t.Run(canceledFolder, func(t *testing.T) {
+			c := newRawConnection(c0ID, bytes.NewReader(nil), io.Discard, testutil.NoopCloser{}, nil, new(mockedConnectionInfo), CompressionNever)
+			defer close(c.closed)
+			scopes := make(map[string]context.Context)
+			cancels := make(map[string]context.CancelFunc)
+			released := make(map[string]chan struct{})
+			for _, id := range []string{"A", "B"} {
+				scopes[id], cancels[id] = context.WithCancel(context.Background())
+				defer cancels[id]()
+				released[id] = make(chan struct{})
+			}
+			admitted := make(chan struct{})
+			c.announcementAdmit = func(_ context.Context, id string, _ bool) (context.Context, func(), error) {
+				if id == "B" {
+					close(admitted)
+				}
+				return scopes[id], func() { close(released[id]) }, nil
+			}
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				c.ClusterConfig(&ClusterConfig{Folders: []Folder{{ID: "A"}, {ID: "B"}}}, nil)
+			}()
+			<-admitted // No writer consumes clusterConfigBox: the snapshot cannot be enqueued.
+			cancels[canceledFolder]()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("unsent snapshot did not cancel")
+			}
+			for _, ch := range released {
+				select {
+				case <-ch:
+				default:
+					t.Fatal("snapshot borrow not released")
+				}
+			}
+			other := "A"
+			if canceledFolder == "A" {
+				other = "B"
+			}
+			if scopes[other].Err() != nil {
+				t.Fatal("sibling scope canceled")
+			}
+			select {
+			case <-c.clusterConfigBox:
+				t.Fatal("partial or stale snapshot sent")
+			default:
+			}
+		})
+	}
+}
+
+func TestClusterConfigAcceptedCancellationWaitsForCompletion(t *testing.T) {
+	c := newRawConnection(c0ID, bytes.NewReader(nil), io.Discard, testutil.NoopCloser{}, nil, new(mockedConnectionInfo), CompressionNever)
+	defer close(c.closed)
+	scope, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	released := make(chan struct{})
+	c.folderAdmit = func(context.Context, string) (context.Context, func(), error) {
+		return scope, func() { close(released) }, nil
+	}
+	done := make(chan struct{})
+	go func() { defer close(done); c.ClusterConfig(&ClusterConfig{Folders: []Folder{{ID: "A"}}}, nil) }()
+	message := <-c.clusterConfigBox
+	cancel()
+	select {
+	case <-released:
+		t.Fatal("released before writer completion")
+	default:
+	}
+	if written, err := c.writeClusterConfig(message); err != nil || written {
+		t.Fatalf("canceled snapshot written: %v %v", written, err)
+	}
+	<-done
+	<-released
+	// A fresh sibling snapshot still completes on the same connection.
+	c.folderAdmit = func(ctx context.Context, _ string) (context.Context, func(), error) { return ctx, func() {}, nil }
+	doneFresh := make(chan struct{})
+	go func() { c.ClusterConfig(&ClusterConfig{Folders: []Folder{{ID: "B"}}}, nil); close(doneFresh) }()
+	fresh := <-c.clusterConfigBox
+	if written, err := c.writeClusterConfig(fresh); err != nil || !written {
+		t.Fatalf("fresh sibling failed: %v %v", written, err)
+	}
+	<-doneFresh
+}
+
+func TestClusterConfigWritingCancellationRetainsBorrow(t *testing.T) {
+	writer := heldFolderWriter{make(chan struct{}, 1), make(chan struct{})}
+	c := newRawConnection(c0ID, bytes.NewReader(nil), writer, testutil.NoopCloser{}, nil, new(mockedConnectionInfo), CompressionNever)
+	scope, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	released := make(chan struct{})
+	c.folderAdmit = func(context.Context, string) (context.Context, func(), error) {
+		return scope, func() { close(released) }, nil
+	}
+	exited := make(chan struct{})
+	go func() { defer close(exited); c.writerLoop() }()
+	var resume sync.Once
+	defer func() { resume.Do(func() { close(writer.resume) }); close(c.closed); <-exited }()
+	done := make(chan struct{})
+	go func() { defer close(done); c.ClusterConfig(&ClusterConfig{Folders: []Folder{{ID: "A"}}}, nil) }()
+	<-writer.entered
+	cancel()
+	select {
+	case <-released:
+		t.Fatal("borrow released during active write")
+	default:
+	}
+	resume.Do(func() { close(writer.resume) })
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("write did not complete")
+	}
+	<-released
+}

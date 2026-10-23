@@ -481,6 +481,7 @@ func (c *rawConnection) ClusterConfig(config *ClusterConfig, _ map[string]string
 	snapshot := *config
 	snapshot.Folders = nil
 	message := clusterConfigMessage{config: &snapshot, done: make(chan struct{})}
+	enqueueCtx := context.Background()
 	defer func() {
 		for _, release := range message.releases {
 			release()
@@ -489,6 +490,9 @@ func (c *rawConnection) ClusterConfig(config *ClusterConfig, _ map[string]string
 	if c.folderAdmit == nil && c.announcementAdmit == nil {
 		snapshot.Folders = config.Folders
 	} else {
+		var cancelEnqueue context.CancelFunc
+		enqueueCtx, cancelEnqueue = context.WithCancel(enqueueCtx)
+		defer cancelEnqueue()
 		for _, folder := range config.Folders {
 			var scope context.Context
 			var release func()
@@ -504,9 +508,20 @@ func (c *rawConnection) ClusterConfig(config *ClusterConfig, _ map[string]string
 			snapshot.Folders = append(snapshot.Folders, folder)
 			message.scopes = append(message.scopes, scope)
 			message.releases = append(message.releases, release)
+			stop := context.AfterFunc(scope, cancelEnqueue)
+			defer stop()
+			if scope.Err() != nil {
+				return
+			}
 		}
 	}
+	// Cancellation only withdraws an unsent snapshot. Once accepted, the
+	// writer owns completion; retain every borrow until it writes or discards it.
+	if enqueueCtx.Err() != nil {
+		return
+	}
 	select {
+	case <-enqueueCtx.Done():
 	case c.clusterConfigBox <- message:
 		if c.folderAdmit != nil || c.announcementAdmit != nil {
 			<-message.done

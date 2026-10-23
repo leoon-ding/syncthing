@@ -7,8 +7,10 @@
 package model
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"runtime"
 	"sync"
 	"testing"
@@ -18,6 +20,7 @@ import (
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/semaphore"
+	"github.com/syncthing/syncthing/lib/testutil"
 )
 
 func TestFolderAccessSealDrainIsolationAndRecovery(t *testing.T) {
@@ -323,6 +326,57 @@ func TestFolderAccessFullIndexFinishesAfterSeal(t *testing.T) {
 	}
 	release()
 	if err := gate.Drain(context.Background(), device1, "one"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFolderAccessUnsentAnnouncementDrainIsolation(t *testing.T) {
+	g := new(FolderAccess)
+	sibling, releaseSibling, err := g.Admit(context.Background(), device1, "B")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer releaseSibling()
+	admitted := make(chan struct{})
+	announce := func(ctx context.Context, id string, paused bool) (context.Context, func(), error) {
+		scope, release, err := g.AdmitAnnouncement(ctx, device1, id, paused)
+		if id == "B" {
+			close(admitted)
+		}
+		return scope, release, err
+	}
+	// No Start: the writer cannot accept the announcement, modeling a busy writer.
+	c := protocol.NewConnectionWithAnnouncement(device1, bytes.NewReader(nil), io.Discard, testutil.NoopCloser{}, nil, nil, protocol.CompressionNever, nil, announce, nil)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.ClusterConfig(&protocol.ClusterConfig{Folders: []protocol.Folder{{ID: "A"}, {ID: "B"}}}, nil)
+	}()
+	<-admitted
+	g.Seal(device1, "A")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := g.Drain(ctx, device1, "A"); err != nil {
+		t.Fatal("revoked folder waits for unsent announcement", err)
+	}
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatal("snapshot retained sibling borrow")
+	}
+	if sibling.Err() != nil {
+		t.Fatal("unrelated B operation canceled")
+	}
+	canceled, stop := context.WithCancel(context.Background())
+	stop()
+	if err := g.Drain(canceled, device1, "B"); !errors.Is(err, context.Canceled) {
+		t.Fatal("B active borrow released", err)
+	}
+	releaseSibling()
+	if err := g.Drain(ctx, device1, "B"); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Open(device1, "A"); err != nil {
 		t.Fatal(err)
 	}
 }
