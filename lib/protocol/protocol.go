@@ -451,6 +451,14 @@ func (c *rawConnection) Request(ctx context.Context, req *Request) ([]byte, erro
 	}
 	c.awaiting[id] = rc
 	c.awaitingMut.Unlock()
+	// Cancellation can end a request before it is sent or answered. Retire its
+	// registration under the same lock used by responses and connection close.
+	// Those paths own channel closure; an abandoned receiver need not close it.
+	defer func() {
+		c.awaitingMut.Lock()
+		delete(c.awaiting, id)
+		c.awaitingMut.Unlock()
+	}()
 
 	req.ID = id
 	ok := c.send(ctx, req.toWire(), nil)

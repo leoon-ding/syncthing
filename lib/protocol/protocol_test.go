@@ -1125,3 +1125,126 @@ func TestClusterConfigWritingCancellationRetainsBorrow(t *testing.T) {
 	}
 	<-released
 }
+
+// Pause send's context evaluation after registration, without a timing poll.
+type requestEnqueueContext struct {
+	context.Context
+	entered, resume chan struct{}
+	reads           int
+}
+
+func (c *requestEnqueueContext) Done() <-chan struct{} {
+	c.reads++
+	if c.reads == 2 {
+		close(c.entered)
+		<-c.resume
+	}
+	return c.Context.Done()
+}
+
+func TestRequestFailedEnqueueRetiresAwaiting(t *testing.T) {
+	for _, disconnect := range []bool{false, true} {
+		t.Run(fmt.Sprint(disconnect), func(t *testing.T) {
+			c := getRawConnection(NewConnection(c0ID, bytes.NewReader(nil), io.Discard, testutil.NoopCloser{}, newTestModel(), new(mockedConnectionInfo), CompressionNever, testKeyGen))
+			base, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			ctx := &requestEnqueueContext{Context: base, entered: make(chan struct{}), resume: make(chan struct{})}
+			done := make(chan error, 1)
+			go func() { _, err := c.Request(ctx, &Request{Folder: "A", Name: "file"}); done <- err }()
+			<-ctx.entered
+			if disconnect {
+				c.internalClose(ErrClosed)
+			} else {
+				cancel()
+			}
+			close(ctx.resume)
+			if err := <-done; !errors.Is(err, ErrClosed) {
+				t.Fatal("enqueue error changed", err)
+			}
+			c.awaitingMut.Lock()
+			n := len(c.awaiting)
+			c.awaitingMut.Unlock()
+			if n != 0 {
+				t.Fatalf("awaiting retained: %d", n)
+			}
+		})
+	}
+}
+
+func TestRequestCancelIgnoresLateResponse(t *testing.T) {
+	c := newRawConnection(c0ID, bytes.NewReader(nil), io.Discard, testutil.NoopCloser{}, nil, new(mockedConnectionInfo), CompressionNever)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { _, err := c.Request(ctx, &Request{Folder: "A", Name: "old"}); done <- err }()
+	old := (<-c.outbox).msg.(*bep.Request)
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	c.awaitingMut.Lock()
+	n := len(c.awaiting)
+	c.awaitingMut.Unlock()
+	if n != 0 {
+		t.Fatalf("canceled request retained: %d", n)
+	}
+	result := make(chan asyncResult, 1)
+	go func() {
+		data, err := c.Request(context.Background(), &Request{Folder: "B", Name: "new"})
+		result <- asyncResult{data, err}
+	}()
+	next := (<-c.outbox).msg.(*bep.Request)
+	c.handleResponse(&Response{ID: int(old.Id), Data: []byte("late")})
+	select {
+	case <-result:
+		t.Fatal("late response completed new request")
+	default:
+	}
+	c.handleResponse(&Response{ID: int(next.Id), Data: []byte("current")})
+	got := <-result
+	if got.err != nil || string(got.val) != "current" {
+		t.Fatalf("new request: %q %v", got.val, got.err)
+	}
+	c.awaitingMut.Lock()
+	n = len(c.awaiting)
+	c.awaitingMut.Unlock()
+	if n != 0 {
+		t.Fatalf("completed request retained: %d", n)
+	}
+}
+
+func TestRequestCancelResponseCloseRace(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		c := getRawConnection(NewConnection(c0ID, bytes.NewReader(nil), io.Discard, testutil.NoopCloser{}, newTestModel(), new(mockedConnectionInfo), CompressionNever, testKeyGen))
+		ctx, cancel := context.WithCancel(context.Background())
+		result := make(chan asyncResult, 1)
+		go func() {
+			data, err := c.Request(ctx, &Request{Folder: "A", Name: "file"})
+			result <- asyncResult{data, err}
+		}()
+		req := (<-c.outbox).msg.(*bep.Request)
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for _, action := range []func(){cancel, func() { c.handleResponse(&Response{ID: int(req.Id), Data: []byte("data")}) }, func() { c.internalClose(ErrClosed) }} {
+			wg.Add(1)
+			go func(f func()) { defer wg.Done(); <-start; f() }(action)
+		}
+		close(start)
+		wg.Wait()
+		got := <-result
+		if got.err == nil {
+			if string(got.val) != "data" {
+				t.Fatal("wrong response")
+			}
+		} else if !errors.Is(got.err, context.Canceled) && !errors.Is(got.err, ErrClosed) {
+			t.Fatal(got.err)
+		}
+		c.handleResponse(&Response{ID: int(req.Id), Data: []byte("duplicate")})
+		c.awaitingMut.Lock()
+		n := len(c.awaiting)
+		c.awaitingMut.Unlock()
+		if n != 0 {
+			t.Fatalf("awaiting after race: %d", n)
+		}
+	}
+}
