@@ -1367,7 +1367,7 @@ func (m *model) ClusterConfig(conn protocol.Connection, cm *protocol.ClusterConf
 		Device: deviceID,
 	})
 
-	if len(tempIndexFolders) > 0 {
+	{ // Reconcile even an empty set: a real withdrawal removes subscriptions.
 		var connOK bool
 		var conn protocol.Connection
 		m.mut.RLock()
@@ -1378,7 +1378,7 @@ func (m *model) ClusterConfig(conn protocol.Connection, cm *protocol.ClusterConf
 		// In case we've got ClusterConfig, and the connection disappeared
 		// from infront of our nose.
 		if connOK {
-			m.progressEmitter.temporaryIndexSubscribe(conn, tempIndexFolders)
+			m.progressEmitter.temporaryIndexSubscribe(conn, tempIndexFolders, withheld)
 		}
 	}
 
@@ -1577,6 +1577,7 @@ func (m *model) ccHandleFolders(folders []protocol.Folder, deviceCfg config.Devi
 	maps.Copy(retained, seenFolders)
 	for id := range withheld {
 		retained[id] = remoteFolderUnknown
+		delete(expiredPending, id)
 	}
 	indexHandlers.RemoveAllExcept(retained)
 

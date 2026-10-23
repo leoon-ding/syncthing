@@ -331,7 +331,7 @@ func (s *service) handleConns(ctx context.Context) error {
 		_ = c.SetDeadline(time.Now().Add(20 * time.Second))
 		go func() {
 			// Exchange Hello messages with the peer.
-			outgoing := s.helloForDevice(remoteID, c.IsLocal())
+			outgoing := s.helloForDevice(remoteID)
 			incoming, err := protocol.ExchangeHello(c, outgoing)
 			// The timestamps are used to create the connection ID.
 			c.connectionID = newConnectionID(outgoing.Timestamp, incoming.Timestamp)
@@ -344,17 +344,16 @@ func (s *service) handleConns(ctx context.Context) error {
 	}
 }
 
-func (s *service) helloForDevice(remoteID protocol.DeviceID, local bool) protocol.Hello {
+func (s *service) helloForDevice(remoteID protocol.DeviceID) protocol.Hello {
 	hello := protocol.Hello{
 		ClientName:    "syncthing",
 		ClientVersion: build.Version,
 		Timestamp:     time.Now().UnixNano(),
 	}
 	if cfg, ok := s.cfg.Device(remoteID); ok {
+		// Hello negotiates the total, including LAN connections. The WAN-only
+		// limit is enforced locally and must not reduce the peer's total target.
 		hello.NumConnections = cfg.NumConnections()
-		if !local && s.singleWANConnection() {
-			hello.NumConnections = 1
-		}
 		// Set our name (from the config of our device ID) only if we
 		// already know about the other side device ID.
 		if myCfg, ok := s.cfg.Device(s.myID); ok {

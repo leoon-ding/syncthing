@@ -131,7 +131,7 @@ func TestSendDownloadProgressMessages(t *testing.T) {
 	defer cancel()
 
 	p := NewProgressEmitter(c, evLogger)
-	p.temporaryIndexSubscribe(fc, []string{"folder", "folder2"})
+	p.temporaryIndexSubscribe(fc, []string{"folder", "folder2"}, nil)
 	p.registry["folder"] = make(map[string]*sharedPullerState)
 	p.registry["folder2"] = make(map[string]*sharedPullerState)
 	p.registry["folderXXX"] = make(map[string]*sharedPullerState)
@@ -438,7 +438,7 @@ func TestSendDownloadProgressMessages(t *testing.T) {
 	expectEmpty()
 
 	p.temporaryIndexUnsubscribe(fc)
-	p.temporaryIndexSubscribe(fc, []string{"folder"})
+	p.temporaryIndexSubscribe(fc, []string{"folder"}, nil)
 
 	sendMsgs(p)
 

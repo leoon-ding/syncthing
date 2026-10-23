@@ -4533,3 +4533,104 @@ func TestConcurrentPromotionInitialClusterConfigDelivery(t *testing.T) {
 		t.Fatalf("duplicate initial config: %d calls", got)
 	}
 }
+
+func TestWithheldPendingFolderRetentionAndRecovery(t *testing.T) {
+	cfg, _ := newDefaultCfgWrapper(t)
+	gate := new(FolderAccess)
+	m := setupModel(t, cfg, gate)
+	defer cleanupModel(m)
+	conn := newFakeConnection(device1, m)
+	m.AddConnection(conn, protocol.Hello{})
+	apply := func(folders ...protocol.Folder) {
+		t.Helper()
+		for i := range folders {
+			folders[i].Devices = []protocol.Device{{ID: myID}, {ID: device1}}
+		}
+		if err := m.ClusterConfig(conn, &protocol.ClusterConfig{Folders: folders}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	check := func(want map[string]string) {
+		t.Helper()
+		pending, err := m.observed.PendingFoldersForDevice(device1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(pending) != len(want) {
+			t.Fatalf("pending=%v want=%v", pending, want)
+		}
+		for id, label := range want {
+			if pending[id].OfferedBy[device1].Label != label {
+				t.Fatalf("pending %s: %+v", id, pending[id])
+			}
+		}
+	}
+	apply(protocol.Folder{ID: "A", Label: "old"}, protocol.Folder{ID: "B"})
+	gate.Seal(device1, "A")
+	gate.Seal(device1, "C")
+	apply(protocol.Folder{ID: "A", Label: "untrusted"}, protocol.Folder{ID: "C"})
+	check(map[string]string{"A": "old"}) // B really withdrew; C never becomes pending.
+	if err := gate.Open(device1, "A"); err != nil {
+		t.Fatal(err)
+	}
+	check(map[string]string{"A": "old"}) // No remote retransmission required to retain it.
+	apply(protocol.Folder{ID: "A", Label: "fresh"})
+	check(map[string]string{"A": "fresh"})
+	gate.Seal(device1, "A")
+	apply()
+	check(nil)
+}
+
+func TestWithheldTemporaryIndexRetentionAndRecovery(t *testing.T) {
+	cfg := config.Configuration{Version: config.CurrentVersion, Devices: []config.DeviceConfiguration{{DeviceID: device1}}}
+	for _, id := range []string{"A", "B", "C"} {
+		cfg.Folders = append(cfg.Folders, config.FolderConfiguration{ID: id, FilesystemType: config.FilesystemTypeFake, Path: id, Devices: []config.FolderDeviceConfiguration{{DeviceID: device1}}})
+	}
+	wrapper, cancel := newConfigWrapper(cfg)
+	defer cancel()
+	gate := new(FolderAccess)
+	m := setupModel(t, wrapper, gate)
+	defer cleanupModel(m)
+	conn := newFakeConnection(device1, m)
+	m.AddConnection(conn, protocol.Hello{})
+	apply := func(ids ...string) {
+		t.Helper()
+		cc := &protocol.ClusterConfig{}
+		for _, id := range ids {
+			cc.Folders = append(cc.Folders, protocol.Folder{ID: id, Devices: []protocol.Device{{ID: myID}, {ID: device1}}})
+		}
+		if err := m.ClusterConfig(conn, cc); err != nil {
+			t.Fatal(err)
+		}
+	}
+	check := func(want ...string) {
+		t.Helper()
+		m.progressEmitter.mut.Lock()
+		got := slices.Clone(m.progressEmitter.foldersByConns[device1])
+		m.progressEmitter.mut.Unlock()
+		slices.Sort(got)
+		slices.Sort(want)
+		if !slices.Equal(got, want) {
+			t.Fatalf("subscriptions=%v want=%v", got, want)
+		}
+	}
+	apply("A", "B")
+	check("A", "B")
+	gate.Seal(device1, "A")
+	gate.Seal(device1, "C")
+	apply("A", "B", "C")
+	check("A", "B")
+	apply("A", "B", "C") // Repeated announcements must not duplicate retained entries.
+	check("A", "B")
+	if err := gate.Open(device1, "A"); err != nil {
+		t.Fatal(err)
+	}
+	check("A", "B")
+	apply("A", "B")
+	check("A", "B")
+	gate.Seal(device1, "A")
+	apply("A") // No newly accepted subscriptions, but retain A and remove B.
+	check("A")
+	apply()
+	check()
+}

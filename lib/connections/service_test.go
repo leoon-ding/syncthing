@@ -159,8 +159,8 @@ func TestNativeWANConnectionTargetAndHandoff(t *testing.T) {
 	if got := s.desiredConnectionsToDevice(id); got != 1 {
 		t.Fatal("WAN target", got)
 	}
-	if s.helloForDevice(id, false).NumConnections != 1 || s.helloForDevice(id, true).NumConnections != 3 {
-		t.Fatal("Hello policy changed LAN or missed WAN")
+	if s.helloForDevice(id).NumConnections != 3 {
+		t.Fatal("WAN policy reduced the Hello total")
 	}
 	if err := s.connectionCheckEarly(id, internalConn{priority: 50}); !errors.Is(err, errDeviceAlreadyConnected) {
 		t.Fatal("duplicate occupied upgrade slot", err)
@@ -177,7 +177,7 @@ func TestNativeWANConnectionTargetAndHandoff(t *testing.T) {
 		t.Fatal("LAN target changed", got)
 	}
 	active = false
-	if s.helloForDevice(id, false).NumConnections != 3 {
+	if s.helloForDevice(id).NumConnections != 3 {
 		t.Fatal("legacy policy not restored")
 	}
 	if s.desiredConnectionsToDevice(protocol.NewDeviceID([]byte("unknown"))) != 0 {
@@ -252,5 +252,25 @@ func TestNativeWANLimitExcludesLANConnections(t *testing.T) {
 				t.Fatal("WAN policy reduced LAN connection target")
 			}
 		})
+	}
+}
+
+func TestWANHelloPreservesPeerMixedConnectionBudget(t *testing.T) {
+	id := protocol.NewDeviceID([]byte("mixed-hello"))
+	cfg := config.New(protocol.LocalDeviceID)
+	cfg.Devices = append(cfg.Devices, config.DeviceConfiguration{DeviceID: id, RawNumConnections: 3})
+	sender := &service{cfg: config.Wrap("", cfg, protocol.LocalDeviceID, events.NoopLogger)}
+	sender.options.SingleWANConnection = func() bool { return true }
+	for _, limited := range []bool{false, true} {
+		peer := &service{cfg: sender.cfg}
+		peer.options.SingleWANConnection = func() bool { return limited }
+		peer.wantConnections = map[protocol.DeviceID]int{id: sender.helloForDevice(id).NumConnections}
+		peer.connections = map[protocol.DeviceID][]protocol.Connection{id: {nativePolicyConnection{priority: 50}, nativePolicyConnection{local: true, priority: 10}}}
+		if got := peer.negotiatedConnectionsToDevice(id); got != 3 {
+			t.Fatalf("peer policy=%v total=%d", limited, got)
+		}
+		if err := peer.connectionCheckEarly(id, internalConn{priority: 10, isLocal: true}); err != nil {
+			t.Fatalf("peer policy=%v rejected additional LAN: %v", limited, err)
+		}
 	}
 }
