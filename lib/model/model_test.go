@@ -4380,3 +4380,103 @@ func TestFolderReopenRegeneratesClusterConfig(t *testing.T) {
 		t.Fatal("model did not regenerate advertisement")
 	}
 }
+
+func TestIntroducerWithheldFolderIsolationAndRecovery(t *testing.T) {
+	for _, pause := range []bool{false, true} {
+		t.Run(fmt.Sprintf("pause=%v", pause), func(t *testing.T) {
+			onlyA := protocol.NewDeviceID([]byte("only-A"))
+			onlyB := protocol.NewDeviceID([]byte("only-B"))
+			both := protocol.NewDeviceID([]byte("both"))
+			fresh := protocol.NewDeviceID([]byte("fresh"))
+			cfg := config.Configuration{Version: config.CurrentVersion, Devices: []config.DeviceConfiguration{{DeviceID: device1, Introducer: true}}}
+			for _, id := range []protocol.DeviceID{onlyA, onlyB, both} {
+				cfg.Devices = append(cfg.Devices, config.DeviceConfiguration{DeviceID: id, IntroducedBy: device1})
+			}
+			for _, id := range []string{"A", "B"} {
+				specific := onlyA
+				if id == "B" {
+					specific = onlyB
+				}
+				cfg.Folders = append(cfg.Folders, config.FolderConfiguration{ID: id, FilesystemType: config.FilesystemTypeFake, Path: id, Devices: []config.FolderDeviceConfiguration{{DeviceID: device1}, {DeviceID: specific, IntroducedBy: device1}, {DeviceID: both, IntroducedBy: device1}}})
+			}
+			wrapper, cancel := newConfigWrapper(cfg)
+			defer cancel()
+			gate := new(FolderAccess)
+			m := setupModel(t, wrapper, gate)
+			defer cleanupModel(m)
+			conn := newFakeConnection(device1, m)
+			m.AddConnection(conn, protocol.Hello{})
+			apply := func(folders ...protocol.Folder) {
+				t.Helper()
+				if err := m.ClusterConfig(conn, &protocol.ClusterConfig{Folders: folders}); err != nil {
+					t.Fatal(err)
+				}
+				// Serialize behind the introducer's configuration mutation and finish its subscribers.
+				w, err := wrapper.Modify(func(*config.Configuration) {})
+				if err != nil {
+					t.Fatal(err)
+				}
+				w.Wait()
+			}
+			announced := func(id string, peers ...protocol.DeviceID) protocol.Folder {
+				f := protocol.Folder{ID: id, Devices: []protocol.Device{{ID: myID}, {ID: device1}}}
+				for _, peer := range peers {
+					f.Devices = append(f.Devices, protocol.Device{ID: peer})
+				}
+				return f
+			}
+			checkShare := func(folder string, id protocol.DeviceID, want bool) {
+				t.Helper()
+				fcfg := wrapper.Folders()[folder]
+				if got := fcfg.SharedWith(id); got != want {
+					t.Fatalf("folder %s peer %v shared=%v want=%v", folder, id, got, want)
+				}
+			}
+			checkDevice := func(id protocol.DeviceID, want bool) {
+				t.Helper()
+				if _, got := wrapper.Device(id); got != want {
+					t.Fatalf("device %v exists=%v want=%v", id, got, want)
+				}
+			}
+			if pause {
+				gate.Seal(device1, "A")
+				if err := gate.CommitPause(device1, "A"); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				gate.Seal(device1, "A")
+			}
+			// A is withheld, B explicitly withdraws its old peers and introduces fresh.
+			apply(announced("A", fresh), announced("B", fresh))
+			checkShare("A", onlyA, true)
+			checkShare("A", both, true)
+			checkShare("A", fresh, false)
+			checkShare("B", onlyB, false)
+			checkShare("B", both, false)
+			checkShare("B", fresh, true)
+			checkDevice(onlyA, true)
+			checkDevice(both, true)
+			checkDevice(onlyB, false)
+			checkDevice(fresh, true)
+			// Once A is admissible, its next announcement becomes authoritative again.
+			if err := gate.Open(device1, "A"); err != nil {
+				t.Fatal(err)
+			}
+			apply(announced("A", fresh), announced("B", fresh))
+			checkShare("A", fresh, true)
+			checkShare("A", onlyA, false)
+			checkShare("A", both, false)
+			checkDevice(onlyA, false)
+			checkDevice(both, false)
+			// A genuinely absent on the wire is a withdrawal even while locally sealed.
+			gate.Seal(device1, "A")
+			apply(announced("B", fresh))
+			checkShare("A", fresh, false)
+			checkShare("B", fresh, true)
+			checkDevice(fresh, true)
+			apply(announced("B"))
+			checkShare("B", fresh, false)
+			checkDevice(fresh, false)
+		})
+	}
+}

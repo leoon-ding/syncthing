@@ -1385,6 +1385,14 @@ func (m *model) ClusterConfig(conn protocol.Connection, cm *protocol.ClusterConf
 	if deviceCfg.Introducer {
 		m.cfg.Modify(func(cfg *config.Configuration) {
 			folders, devices, foldersDevices, introduced := m.handleIntroductions(deviceCfg, cm, cfg.FolderMap(), cfg.DeviceMap())
+			// Locally withheld folders are not remote withdrawals. Carry only
+			// their currently configured pairs into removal reconciliation;
+			// never introduce new shares from an inadmissible announcement.
+			for folderID := range withheld {
+				for _, device := range folders[folderID].Devices {
+					foldersDevices.set(device.DeviceID, folderID)
+				}
+			}
 			folders, devices, deintroduced := m.handleDeintroductions(deviceCfg, foldersDevices, folders, devices)
 			if !introduced && !deintroduced {
 				return
