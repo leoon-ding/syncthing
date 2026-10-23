@@ -393,9 +393,10 @@ func (s *service) connectionCheckEarly(remoteID protocol.DeviceID, c internalCon
 		return errNetworkNotAllowed
 	}
 
-	currentConns, worstPrio, wanCount, wanWorst := s.admissionConnections(cfg.DeviceID)
+	singleWAN := s.singleWANConnection()
+	currentConns, worstPrio, wanCount, wanWorst := s.admissionConnections(cfg.DeviceID, singleWAN)
 	desiredConns := s.negotiatedConnectionsToDevice(cfg.DeviceID)
-	if !c.IsLocal() && s.singleWANConnection() {
+	if !c.IsLocal() && singleWAN {
 		// LAN links do not consume the WAN slot. Keep the independent total
 		// connection/priority check below so the embedding policy cannot relax it.
 		if wanCount > 0 && c.priority+s.cfg.Options().ConnectionPriorityUpgradeThreshold >= wanWorst {
@@ -666,7 +667,8 @@ func (s *service) dialDevices(ctx context.Context, now time.Time, cfg config.Con
 		// See if we are already connected and, if so, what our cutoff is
 		// for dialer priority.
 		priorityCutoff := worstDialerPriority
-		if currentConns, worst, _, _ := s.admissionConnections(deviceCfg.DeviceID); currentConns > 0 {
+		singleWAN := s.singleWANConnection()
+		if currentConns, worst, _, _ := s.admissionConnections(deviceCfg.DeviceID, singleWAN); currentConns > 0 {
 			// Set the priority cutoff to the current connection's priority,
 			// so that we don't attempt any dialers with worse priority.
 			priorityCutoff = worst
@@ -675,7 +677,7 @@ func (s *service) dialDevices(ctx context.Context, now time.Time, cfg config.Con
 			// we don't attempt dialers that aren't considered a worthy upgrade.
 			priorityCutoff -= cfg.Options.ConnectionPriorityUpgradeThreshold
 
-			if bestDialerPriority >= priorityCutoff && currentConns >= s.desiredConnectionsToDevice(deviceCfg.DeviceID) {
+			if bestDialerPriority >= priorityCutoff && currentConns >= s.desiredConnectionsToDevice(deviceCfg.DeviceID, singleWAN) {
 				// Our best dialer is not any better than what we already
 				// have, and we already have the desired number of
 				// connections to this device,so nothing to do here.
@@ -684,7 +686,7 @@ func (s *service) dialDevices(ctx context.Context, now time.Time, cfg config.Con
 			}
 		}
 
-		dialTargets := s.resolveDialTargets(ctx, now, cfg, deviceCfg, nextDialAt, initial, priorityCutoff)
+		dialTargets := s.resolveDialTargets(ctx, now, cfg, deviceCfg, nextDialAt, initial, priorityCutoff, singleWAN)
 		if len(dialTargets) > 0 {
 			queue = append(queue, dialQueueEntry{
 				id:         deviceCfg.DeviceID,
@@ -743,7 +745,7 @@ func (s *service) dialDevices(ctx context.Context, now time.Time, cfg config.Con
 	}
 }
 
-func (s *service) resolveDialTargets(ctx context.Context, now time.Time, cfg config.Configuration, deviceCfg config.DeviceConfiguration, nextDialAt nextDialRegistry, initial bool, priorityCutoff int) []dialTarget {
+func (s *service) resolveDialTargets(ctx context.Context, now time.Time, cfg config.Configuration, deviceCfg config.DeviceConfiguration, nextDialAt nextDialRegistry, initial bool, priorityCutoff int, singleWAN bool) []dialTarget {
 	deviceID := deviceCfg.DeviceID
 
 	addrs := s.resolveDeviceAddrs(ctx, deviceCfg)
@@ -791,7 +793,7 @@ func (s *service) resolveDialTargets(ctx context.Context, now time.Time, cfg con
 
 		dialer := dialerFactory.New(s.cfg.Options(), s.tlsCfg, s.registry, s.lanChecker)
 		priority := dialer.Priority(uri.Host)
-		currentConns, _, _, _ := s.admissionConnections(deviceCfg.DeviceID)
+		currentConns, _, _, _ := s.admissionConnections(deviceCfg.DeviceID, singleWAN)
 		if priority > priorityCutoff {
 			l.Debugf("Not dialing %s at %s using %s as priority is worse than current connection (%d > %d)", deviceID.Short(), addr, dialerFactory, priority, priorityCutoff)
 			continue
@@ -800,7 +802,7 @@ func (s *service) resolveDialTargets(ctx context.Context, now time.Time, cfg con
 			l.Debugf("Not dialing %s at %s using %s as it does not allow multiple connections and we already have a connection", deviceID.Short(), addr, dialerFactory)
 			continue
 		}
-		if currentConns >= s.desiredConnectionsToDevice(deviceCfg.DeviceID) && priority == priorityCutoff {
+		if currentConns >= s.desiredConnectionsToDevice(deviceCfg.DeviceID, singleWAN) && priority == priorityCutoff {
 			l.Debugf("Not dialing %s at %s using %s as priority is equal and we already have %d/%d connections", deviceID.Short(), addr, dialerFactory, currentConns, deviceCfg.NumConnections())
 			continue
 		}
@@ -1525,13 +1527,13 @@ func (s *service) singleWANConnection() bool {
 // admissionConnections separates usable paths from resources still awaiting
 // release. Never remove tracker entries or refund embedding quotas here.
 // Preserve legacy host accounting when the native WAN policy is inactive.
-func (s *service) admissionConnections(id protocol.DeviceID) (count, worst, wanCount, wanWorst int) {
-	activeOnly := s.singleWANConnection()
+// The caller samples singleWAN once for the snapshot and its admission decision.
+func (s *service) admissionConnections(id protocol.DeviceID, singleWAN bool) (count, worst, wanCount, wanWorst int) {
 	s.connectionsMut.Lock()
 	defer s.connectionsMut.Unlock()
 	worst, wanWorst = math.MinInt, math.MinInt
 	for _, conn := range s.connections[id] {
-		if activeOnly {
+		if singleWAN {
 			select {
 			case <-conn.Closed():
 				continue
@@ -1551,15 +1553,15 @@ func (s *service) admissionConnections(id protocol.DeviceID) (count, worst, wanC
 	return
 }
 
-func (s *service) desiredConnectionsToDevice(deviceID protocol.DeviceID) int {
+func (s *service) desiredConnectionsToDevice(deviceID protocol.DeviceID, singleWAN bool) int {
 	_, ok := s.cfg.Device(deviceID)
 	if !ok {
 		// We want no connections to an unknown device.
 		return 0
 	}
 
-	if s.singleWANConnection() {
-		count, _, wan, _ := s.admissionConnections(deviceID)
+	if singleWAN {
+		count, _, wan, _ := s.admissionConnections(deviceID, singleWAN)
 		if wan > 0 && wan == count {
 			return 1
 		}

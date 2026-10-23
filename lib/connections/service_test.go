@@ -154,12 +154,12 @@ func TestNativeWANConnectionTargetAndHandoff(t *testing.T) {
 	s := &service{cfg: config.Wrap("", cfg, protocol.LocalDeviceID, events.NoopLogger)}
 	s.connections = map[protocol.DeviceID][]protocol.Connection{id: {nativePolicyConnection{priority: 50}}}
 	s.wantConnections = map[protocol.DeviceID]int{id: 3}
-	if got := s.desiredConnectionsToDevice(id); got != 3 {
+	if got := s.desiredConnectionsToDevice(id, s.singleWANConnection()); got != 3 {
 		t.Fatal("legacy target", got)
 	}
 	active := true
 	s.options.SingleWANConnection = func() bool { return active }
-	if got := s.desiredConnectionsToDevice(id); got != 1 {
+	if got := s.desiredConnectionsToDevice(id, s.singleWANConnection()); got != 1 {
 		t.Fatal("WAN target", got)
 	}
 	if s.helloForDevice(id).NumConnections != 3 {
@@ -176,14 +176,14 @@ func TestNativeWANConnectionTargetAndHandoff(t *testing.T) {
 		t.Fatal("stale concurrent Hello accepted", err)
 	}
 	s.connections[id] = []protocol.Connection{nativePolicyConnection{local: true, priority: 10}}
-	if got := s.desiredConnectionsToDevice(id); got != 3 {
+	if got := s.desiredConnectionsToDevice(id, s.singleWANConnection()); got != 3 {
 		t.Fatal("LAN target changed", got)
 	}
 	active = false
 	if s.helloForDevice(id).NumConnections != 3 {
 		t.Fatal("legacy policy not restored")
 	}
-	if s.desiredConnectionsToDevice(protocol.NewDeviceID([]byte("unknown"))) != 0 {
+	if s.desiredConnectionsToDevice(protocol.NewDeviceID([]byte("unknown")), s.singleWANConnection()) != 0 {
 		t.Fatal("unknown peer target")
 	}
 }
@@ -251,7 +251,7 @@ func TestNativeWANLimitExcludesLANConnections(t *testing.T) {
 			if errors.Is(err, errDeviceAlreadyConnected) != tc.reject {
 				t.Fatalf("admission: %v", err)
 			}
-			if s.desiredConnectionsToDevice(id) != 3 {
+			if s.desiredConnectionsToDevice(id, s.singleWANConnection()) != 3 {
 				t.Fatal("WAN policy reduced LAN connection target")
 			}
 		})
@@ -492,7 +492,7 @@ func TestClosedWANAdmissionAndCapacity(t *testing.T) {
 				if got := s.numConnectionsForDevice(id); got != len(group) {
 					t.Fatalf("resources released early: %d", got)
 				}
-				count, _, _, _ := s.admissionConnections(id)
+				count, _, _, _ := s.admissionConnections(id, s.singleWANConnection())
 				want := len(group)
 				if tc.active {
 					want--
@@ -513,5 +513,71 @@ func TestClosedWANAdmissionAndCapacity(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestWANPolicySampledOnceDuringAdmission(t *testing.T) {
+	for _, initial := range []bool{false, true} {
+		t.Run(fmt.Sprint(initial), func(t *testing.T) {
+			id := protocol.NewDeviceID([]byte("policy-transition"))
+			cfg := config.New(protocol.LocalDeviceID)
+			cfg.Devices = append(cfg.Devices, config.DeviceConfiguration{DeviceID: id, RawNumConnections: 3})
+			s := &service{cfg: config.Wrap("", cfg, protocol.LocalDeviceID, events.NoopLogger)}
+			s.wantConnections = map[protocol.DeviceID]int{id: 3}
+			dead := &wanLimitTestConnection{id: "dead", priority: 50, done: make(chan struct{}), started: make(chan struct{})}
+			close(dead.done)
+			s.connections = map[protocol.DeviceID][]protocol.Connection{id: {dead}}
+			policy, reads := initial, 0
+			s.options.SingleWANConnection = func() bool {
+				reads++
+				result := policy
+				policy = !policy // Deterministically switch immediately after sampling.
+				return result
+			}
+			for attempt := 0; attempt < 2; attempt++ {
+				before := reads
+				if err := s.connectionCheckEarly(id, internalConn{priority: 50}); err != nil {
+					t.Fatalf("same-priority reconnect: %v", err)
+				}
+				if reads != before+1 {
+					t.Fatalf("policy sampled %d times", reads-before)
+				}
+				if s.numConnectionsForDevice(id) != 1 {
+					t.Fatal("admission refunded an unreleased resource")
+				}
+			}
+		})
+	}
+}
+
+func TestWANPolicySnapshotControlsConnectionTarget(t *testing.T) {
+	id := protocol.NewDeviceID([]byte("target-transition"))
+	cfg := config.New(protocol.LocalDeviceID)
+	cfg.Devices = append(cfg.Devices, config.DeviceConfiguration{DeviceID: id, RawNumConnections: 3})
+	s := &service{cfg: config.Wrap("", cfg, protocol.LocalDeviceID, events.NoopLogger)}
+	s.wantConnections = map[protocol.DeviceID]int{id: 3}
+	dead := &wanLimitTestConnection{id: "dead", priority: 50, done: make(chan struct{}), started: make(chan struct{})}
+	close(dead.done)
+	s.connections = map[protocol.DeviceID][]protocol.Connection{id: {dead}}
+	for _, initial := range []bool{false, true} {
+		reads := 0
+		policy := initial
+		s.options.SingleWANConnection = func() bool {
+			reads++
+			result := policy
+			policy = !policy
+			return result
+		}
+		sampled := s.singleWANConnection()
+		count, _, _, _ := s.admissionConnections(id, sampled)
+		if got := s.desiredConnectionsToDevice(id, sampled); got != 3 {
+			t.Fatalf("closed WAN incorrectly reduced target: %d", got)
+		}
+		if (count == 0) != initial || reads != 1 {
+			t.Fatalf("inconsistent policy: initial=%v count=%d reads=%d", initial, count, reads)
+		}
+		if s.numConnectionsForDevice(id) != 1 {
+			t.Fatal("target selection refunded an unreleased resource")
+		}
 	}
 }
