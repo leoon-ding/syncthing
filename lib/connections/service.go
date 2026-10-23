@@ -1480,6 +1480,11 @@ func (s *service) runWANLimit(ctx context.Context, ticks <-chan time.Time) error
 					if _, pending := closing[id]; pending || conn.IsLocal() {
 						continue
 					}
+					select {
+					case <-conn.Closed():
+						continue
+					default:
+					}
 					switch {
 					case best == nil:
 						best = conn

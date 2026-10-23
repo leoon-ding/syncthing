@@ -400,3 +400,52 @@ func TestWANLimitLegacyHostAndIdleStop(t *testing.T) {
 		t.Fatal("idle stop blocked")
 	}
 }
+
+func TestWANLimitRetainsLiveAlternativeDuringClosedLinkRelease(t *testing.T) {
+	id := protocol.NewDeviceID([]byte("closed-release-peer"))
+	dead := &wanLimitTestConnection{id: "dead", priority: 10, started: make(chan struct{}), done: make(chan struct{})}
+	live := &wanLimitTestConnection{id: "live", priority: 30, started: make(chan struct{}), done: make(chan struct{})}
+	// Closed has fired, but the embedding release has not returned, so the
+	// dead connection remains in the tracker exactly as in handleHellos.
+	close(dead.done)
+	s := &service{}
+	s.connections = map[protocol.DeviceID][]protocol.Connection{id: {dead, live}}
+	s.options.SingleWANConnection = func() bool { return true }
+	ctx, cancel := context.WithCancel(context.Background())
+	ticks := make(chan time.Time)
+	finished := make(chan struct{})
+	go func() { defer close(finished); _ = s.runWANLimit(ctx, ticks) }()
+	defer func() { cancel(); close(live.done); <-finished }()
+	for i := 0; i < 2; i++ {
+		select {
+		case ticks <- time.Now():
+		case <-time.After(time.Second):
+			t.Fatal("reconciler stalled")
+		}
+	}
+	// The live alternative must survive both the delayed release and its
+	// eventual tracker removal, without requesting another close of dead.
+	s.connectionsMut.Lock()
+	s.connections[id] = []protocol.Connection{live}
+	s.connectionsMut.Unlock()
+	select {
+	case ticks <- time.Now():
+	case <-time.After(time.Second):
+		t.Fatal("reconciler stalled")
+	}
+	cancel()
+	select {
+	case <-finished:
+	case <-live.started:
+		t.Fatal("live alternative retired in favor of closed link")
+	case <-time.After(time.Second):
+		t.Fatal("stop blocked")
+	}
+	for _, conn := range []*wanLimitTestConnection{dead, live} {
+		select {
+		case <-conn.started:
+			t.Fatalf("unexpected close: %s", conn.id)
+		default:
+		}
+	}
+}

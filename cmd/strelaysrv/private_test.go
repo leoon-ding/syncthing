@@ -95,9 +95,7 @@ func TestPrivateAllocationReplayQuotaAndRelease(t *testing.T) {
 	left, right := net.Pipe()
 	defer right.Close()
 	barrier := &privateCloseBarrier{Conn: left, entered: make(chan struct{}), release: make(chan struct{})}
-	select {
-	case first.connsChan <- barrier:
-	case <-time.After(time.Second):
+	if !first.AddConnection(barrier) {
 		t.Fatal("session did not accept socket")
 	}
 	aborted := make(chan struct{})

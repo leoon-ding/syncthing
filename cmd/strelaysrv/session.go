@@ -51,7 +51,7 @@ func newSession(serverid, clientid syncthingprotocol.DeviceID, sessionLimitBps i
 		clientid:  clientid,
 		rateLimit: makeRateLimitFunc(sessionRateLimit, globalRateLimit),
 		limiter:   sessionRateLimit,
-		connsChan: make(chan net.Conn),
+		connsChan: make(chan net.Conn, 2),
 		stop:      make(chan struct{}),
 		done:      make(chan struct{}),
 		conns:     make([]net.Conn, 0, 2),
@@ -125,6 +125,7 @@ type session struct {
 
 	connsChan chan net.Conn
 	conns     []net.Conn
+	closing   bool
 }
 
 func (s *session) AddConnection(conn net.Conn) bool {
@@ -132,16 +133,23 @@ func (s *session) AddConnection(conn net.Conn) bool {
 		log.Println("New connection for", s, "from", conn.RemoteAddr())
 	}
 
+	// Own accepted sockets before notifying Serve. Scheduling the receiver must
+	// not decide whether a valid invitation can join; the two slots are bounded.
+	s.mut.Lock()
+	defer s.mut.Unlock()
+	if s.closing || len(s.conns) >= 2 || !s.joinDeadline.IsZero() && !time.Now().Before(s.joinDeadline) {
+		return false
+	}
 	select {
-	case s.connsChan <- conn:
-		return true
 	case <-s.done:
 		return false
 	case <-s.stop:
 		return false
 	default:
 	}
-	return false
+	s.conns = append(s.conns, conn)
+	s.connsChan <- conn
+	return true
 }
 
 func (s *session) abort() { s.stopOnce.Do(func() { close(s.stop) }); s.CloseConns() }
@@ -163,21 +171,22 @@ func (s *session) Serve() {
 		log.Println("Session", s, "serving")
 	}
 
+	joined := 0
 	for {
 		select {
-		case conn := <-s.connsChan:
+		case <-s.connsChan:
 			s.mut.Lock()
 			select {
 			case <-s.stop:
 				s.mut.Unlock()
-				conn.Close()
 				goto done
 			default:
 			}
-			s.conns = append(s.conns, conn)
+			joined++
 			s.mut.Unlock()
-			// We're the only ones mutating s.conns, hence we are free to read it.
-			if len(s.conns) < 2 {
+			// Both socket assignments precede their notifications. Once both
+			// arrive, AddConnection cannot change the full two-entry slice.
+			if joined < 2 {
 				continue
 			}
 
@@ -281,6 +290,7 @@ func (s *session) HasParticipant(id syncthingprotocol.DeviceID) bool {
 
 func (s *session) CloseConns() {
 	s.mut.Lock()
+	s.closing = true
 	for _, conn := range s.conns {
 		conn.Close()
 	}
