@@ -4309,6 +4309,25 @@ func TestIndexAcrossAsymmetricPrimaryConnections(t *testing.T) {
 	if retained {
 		t.Fatal("closed remote primary retained index handler")
 	}
+	// The surviving local primary still matches the fallback's connection
+	// predicate, but a missing registry must make that fallback fail closed.
+	m.mut.RLock()
+	ids := m.deviceConnIDs[device1]
+	remainingPrimary := len(ids) > 0 && ids[0] == incoming.ConnectionID()
+	registry, ok := m.getIndexHandlerRLocked(incoming)
+	m.mut.RUnlock()
+	if !remainingPrimary {
+		t.Fatal("expected the local primary to remain connected")
+	}
+	if ok || registry != nil {
+		t.Fatal("missing registry accepted by primary fallback")
+	}
+	if err := m.Index(incoming, &protocol.Index{Folder: "default"}); !errors.Is(err, ErrFolderNotRunning) {
+		t.Fatalf("index after registry removal: %v", err)
+	}
+	if err := m.IndexUpdate(incoming, &protocol.IndexUpdate{Folder: "default"}); !errors.Is(err, ErrFolderNotRunning) {
+		t.Fatalf("index update after registry removal: %v", err)
+	}
 }
 
 func TestClusterConfigFenceDoesNotWithdrawAdvertisedFolder(t *testing.T) {
