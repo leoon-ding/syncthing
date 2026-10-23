@@ -9,12 +9,14 @@ package connections
 import (
 	"context"
 	"errors"
+	"fmt"
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/protocol"
 	relayprotocol "github.com/syncthing/syncthing/lib/relay/protocol"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -272,5 +274,129 @@ func TestWANHelloPreservesPeerMixedConnectionBudget(t *testing.T) {
 		if err := peer.connectionCheckEarly(id, internalConn{priority: 10, isLocal: true}); err != nil {
 			t.Fatalf("peer policy=%v rejected additional LAN: %v", limited, err)
 		}
+	}
+}
+
+type wanLimitTestConnection struct {
+	protocol.Connection
+	id       string
+	local    bool
+	priority int
+	started  chan struct{}
+	done     chan struct{}
+	once     sync.Once
+}
+
+func (c *wanLimitTestConnection) ConnectionID() string    { return c.id }
+func (c *wanLimitTestConnection) IsLocal() bool           { return c.local }
+func (c *wanLimitTestConnection) Priority() int           { return c.priority }
+func (c *wanLimitTestConnection) Close(error)             { c.once.Do(func() { close(c.started) }); <-c.done }
+func (c *wanLimitTestConnection) Closed() <-chan struct{} { return c.done }
+
+func TestWANLimitActivationAndDrain(t *testing.T) {
+	for _, mixed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("mixed=%v", mixed), func(t *testing.T) {
+			id := protocol.NewDeviceID([]byte("peer"))
+			makeConn := func(name string, priority int, local bool) *wanLimitTestConnection {
+				return &wanLimitTestConnection{id: name, priority: priority, local: local, started: make(chan struct{}), done: make(chan struct{})}
+			}
+			a, b, c := makeConn("a", 30, false), makeConn("b", 30, false), makeConn("c", 50, false)
+			lan := makeConn("lan", 10, true)
+			lan2 := makeConn("lan2", 10, true)
+			group := []protocol.Connection{c, b, a}
+			if mixed {
+				group = append(group, lan, lan2)
+			}
+			s := &service{}
+			s.connections = map[protocol.DeviceID][]protocol.Connection{id: group}
+			var active atomic.Bool
+			s.options.SingleWANConnection = active.Load
+			ctx, cancel := context.WithCancel(context.Background())
+			ticks := make(chan time.Time)
+			finished := make(chan error, 1)
+			go func() { finished <- s.runWANLimit(ctx, ticks) }()
+			defer func() {
+				cancel()
+				close(a.done)
+				close(b.done)
+				close(c.done)
+				close(lan.done)
+				close(lan2.done)
+				<-finished
+			}()
+			tick := func() {
+				t.Helper()
+				select {
+				case ticks <- time.Now():
+				case <-time.After(time.Second):
+					t.Fatal("reconciler stopped")
+				}
+			}
+			tick() // Completed an iteration with the legacy policy.
+			for _, conn := range []*wanLimitTestConnection{a, b, c, lan, lan2} {
+				select {
+				case <-conn.started:
+					t.Fatal("legacy link closed")
+				default:
+				}
+			}
+			active.Store(true)
+			tick()
+			for _, conn := range []*wanLimitTestConnection{b, c} {
+				select {
+				case <-conn.started:
+				case <-time.After(time.Second):
+					t.Fatal("excess WAN not closed")
+				}
+			}
+			// Simulate an attachment that completed after the activation snapshot.
+			late := makeConn("late", 50, false)
+			defer close(late.done)
+			s.connectionsMut.Lock()
+			s.connections[id] = append(s.connections[id], late)
+			s.connectionsMut.Unlock()
+			tick()
+			select {
+			case <-late.started:
+			case <-time.After(time.Second):
+				t.Fatal("late attachment escaped limit")
+			}
+			tick() // Closing links remain accounted but are not selected again.
+			for _, conn := range []*wanLimitTestConnection{a, lan, lan2} {
+				select {
+				case <-conn.started:
+					t.Fatal("best WAN or LAN closed")
+				default:
+				}
+			}
+			cancel()
+			select {
+			case <-finished:
+				t.Fatal("stopped before owned closes drained")
+			default:
+			}
+		})
+	}
+}
+
+func TestWANLimitLegacyHostAndIdleStop(t *testing.T) {
+	s := &service{}
+	ctx, cancel := context.WithCancel(context.Background())
+	ticks := make(chan time.Time)
+	done := make(chan error, 1)
+	go func() { done <- s.runWANLimit(ctx, ticks) }()
+	select {
+	case ticks <- time.Now():
+	case <-time.After(time.Second):
+		t.Fatal("legacy loop stalled")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("idle stop blocked")
 	}
 }

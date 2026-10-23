@@ -134,7 +134,9 @@ type Options struct {
 	// SingleWANConnection reserves the embedding run's second per-peer slot for
 	// path upgrades. LAN connections and hosts without this hook keep the
 	// configured multi-connection policy; no persisted configuration changes.
-	// The hook is read concurrently by dialing and inbound handshakes.
+	// The hook is read concurrently. Existing WAN links converge on the next
+	// periodic reconciliation after activation; closing links retain their
+	// resources until Closed. LAN links are never pruned by this policy.
 	SingleWANConnection func() bool
 	// FolderAnnouncementAdmit receives the advertised pause flag. Nil retains
 	// the FolderAdmit fallback for hosts without separate metadata admission.
@@ -270,6 +272,9 @@ func NewService(cfg config.Wrapper, myID protocol.DeviceID, mdl Model, tlsCfg *t
 	service.Add(svcutil.AsService(service.handleConns, fmt.Sprintf("%s/handleConns", service)))
 	service.Add(svcutil.AsService(service.handleHellos, fmt.Sprintf("%s/handleHellos", service)))
 	service.Add(service.natService)
+	if opts.SingleWANConnection != nil {
+		service.Add(svcutil.AsService(service.serveWANLimit, "native WAN connection limit"))
+	}
 	if opts.PrivateRelay != nil && opts.PrivateRenew != nil {
 		service.Add(svcutil.AsService(service.servePrivateRelay, "private native relay"))
 	}
@@ -1445,6 +1450,69 @@ func (r nextDialRegistry) sleepDurationAndCleanup(now time.Time) time.Duration {
 		}
 	}
 	return sleep
+}
+
+// The embedding hook can become active after this service has started. Reconcile
+// existing links too, including handshakes that straddle that transition.
+func (s *service) serveWANLimit(ctx context.Context) error {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	return s.runWANLimit(ctx, ticker.C)
+}
+
+func (s *service) runWANLimit(ctx context.Context, ticks <-chan time.Time) error {
+	closing := make(map[string]struct{})
+	var workers sync.WaitGroup
+	defer workers.Wait()
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if s.singleWANConnection() {
+			s.connectionsMut.Lock()
+			present := make(map[string]struct{})
+			var retire []protocol.Connection
+			for _, group := range s.connections {
+				var best protocol.Connection
+				for _, conn := range group {
+					id := conn.ConnectionID()
+					present[id] = struct{}{}
+					if _, pending := closing[id]; pending || conn.IsLocal() {
+						continue
+					}
+					switch {
+					case best == nil:
+						best = conn
+					case conn.Priority() < best.Priority() || conn.Priority() == best.Priority() && id < best.ConnectionID():
+						retire = append(retire, best)
+						best = conn
+					default:
+						retire = append(retire, conn)
+					}
+				}
+			}
+			for id := range closing {
+				if _, exists := present[id]; !exists {
+					delete(closing, id)
+				}
+			}
+			s.connectionsMut.Unlock()
+			for _, conn := range retire {
+				closing[conn.ConnectionID()] = struct{}{}
+				workers.Add(1)
+				go func() {
+					defer workers.Done()
+					conn.Close(errReplacingConnection)
+					<-conn.Closed()
+				}()
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticks:
+		}
+	}
 }
 
 func (s *service) singleWANConnection() bool {
