@@ -393,17 +393,15 @@ func (s *service) connectionCheckEarly(remoteID protocol.DeviceID, c internalCon
 		return errNetworkNotAllowed
 	}
 
-	currentConns := s.numConnectionsForDevice(cfg.DeviceID)
+	currentConns, worstPrio, wanCount, wanWorst := s.admissionConnections(cfg.DeviceID)
 	desiredConns := s.negotiatedConnectionsToDevice(cfg.DeviceID)
 	if !c.IsLocal() && s.singleWANConnection() {
 		// LAN links do not consume the WAN slot. Keep the independent total
 		// connection/priority check below so the embedding policy cannot relax it.
-		count, worst := s.wanConnections(remoteID)
-		if count > 0 && c.priority+s.cfg.Options().ConnectionPriorityUpgradeThreshold >= worst {
+		if wanCount > 0 && c.priority+s.cfg.Options().ConnectionPriorityUpgradeThreshold >= wanWorst {
 			return errDeviceAlreadyConnected
 		}
 	}
-	worstPrio := s.worstConnectionPriority(remoteID)
 	ourUpgradeThreshold := c.priority + s.cfg.Options().ConnectionPriorityUpgradeThreshold
 	if currentConns >= desiredConns && ourUpgradeThreshold >= worstPrio {
 		l.Debugf("Not accepting connection to %s at %s: already have %d connections, desire %d", remoteID, c, currentConns, desiredConns)
@@ -668,10 +666,10 @@ func (s *service) dialDevices(ctx context.Context, now time.Time, cfg config.Con
 		// See if we are already connected and, if so, what our cutoff is
 		// for dialer priority.
 		priorityCutoff := worstDialerPriority
-		if currentConns := s.numConnectionsForDevice(deviceCfg.DeviceID); currentConns > 0 {
+		if currentConns, worst, _, _ := s.admissionConnections(deviceCfg.DeviceID); currentConns > 0 {
 			// Set the priority cutoff to the current connection's priority,
 			// so that we don't attempt any dialers with worse priority.
-			priorityCutoff = s.worstConnectionPriority(deviceCfg.DeviceID)
+			priorityCutoff = worst
 
 			// Reduce the priority cutoff by the upgrade threshold, so that
 			// we don't attempt dialers that aren't considered a worthy upgrade.
@@ -793,7 +791,7 @@ func (s *service) resolveDialTargets(ctx context.Context, now time.Time, cfg con
 
 		dialer := dialerFactory.New(s.cfg.Options(), s.tlsCfg, s.registry, s.lanChecker)
 		priority := dialer.Priority(uri.Host)
-		currentConns := s.numConnectionsForDevice(deviceCfg.DeviceID)
+		currentConns, _, _, _ := s.admissionConnections(deviceCfg.DeviceID)
 		if priority > priorityCutoff {
 			l.Debugf("Not dialing %s at %s using %s as priority is worse than current connection (%d > %d)", deviceID.Short(), addr, dialerFactory, priority, priorityCutoff)
 			continue
@@ -1524,18 +1522,33 @@ func (s *service) singleWANConnection() bool {
 	return s.options.SingleWANConnection != nil && s.options.SingleWANConnection()
 }
 
-// wanConnections snapshots only links governed by the embedding WAN limit.
-func (s *service) wanConnections(id protocol.DeviceID) (int, int) {
+// admissionConnections separates usable paths from resources still awaiting
+// release. Never remove tracker entries or refund embedding quotas here.
+// Preserve legacy host accounting when the native WAN policy is inactive.
+func (s *service) admissionConnections(id protocol.DeviceID) (count, worst, wanCount, wanWorst int) {
+	activeOnly := s.singleWANConnection()
 	s.connectionsMut.Lock()
 	defer s.connectionsMut.Unlock()
-	count, worst := 0, math.MinInt
+	worst, wanWorst = math.MinInt, math.MinInt
 	for _, conn := range s.connections[id] {
+		if activeOnly {
+			select {
+			case <-conn.Closed():
+				continue
+			default:
+			}
+		}
+		count++
+		worst = max(worst, conn.Priority())
 		if !conn.IsLocal() {
-			count++
-			worst = max(worst, conn.Priority())
+			wanCount++
+			wanWorst = max(wanWorst, conn.Priority())
 		}
 	}
-	return count, worst
+	if count == 0 {
+		worst = math.MaxInt
+	}
+	return
 }
 
 func (s *service) desiredConnectionsToDevice(deviceID protocol.DeviceID) int {
@@ -1546,17 +1559,8 @@ func (s *service) desiredConnectionsToDevice(deviceID protocol.DeviceID) int {
 	}
 
 	if s.singleWANConnection() {
-		s.connectionsMut.Lock()
-		wan, lan := false, false
-		for _, conn := range s.connections[deviceID] {
-			if !conn.IsLocal() {
-				wan = true
-			} else {
-				lan = true
-			}
-		}
-		s.connectionsMut.Unlock()
-		if wan && !lan {
+		count, _, wan, _ := s.admissionConnections(deviceID)
+		if wan > 0 && wan == count {
 			return 1
 		}
 	}

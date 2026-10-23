@@ -144,8 +144,9 @@ type nativePolicyConnection struct {
 	priority int
 }
 
-func (c nativePolicyConnection) IsLocal() bool { return c.local }
-func (c nativePolicyConnection) Priority() int { return c.priority }
+func (c nativePolicyConnection) Closed() <-chan struct{} { return nil }
+func (c nativePolicyConnection) IsLocal() bool           { return c.local }
+func (c nativePolicyConnection) Priority() int           { return c.priority }
 func TestNativeWANConnectionTargetAndHandoff(t *testing.T) {
 	id := protocol.NewDeviceID([]byte("native-peer"))
 	cfg := config.New(protocol.LocalDeviceID)
@@ -447,5 +448,70 @@ func TestWANLimitRetainsLiveAlternativeDuringClosedLinkRelease(t *testing.T) {
 			t.Fatalf("unexpected close: %s", conn.id)
 		default:
 		}
+	}
+}
+
+func TestClosedWANAdmissionAndCapacity(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		limit    int
+		lan, wan int
+		active   bool
+		reject   bool
+	}{
+		{"single-slot reconnect", 1, 0, 0, true, false},
+		{"mixed reconnect", 3, 2, 0, true, false},
+		{"live WAN still occupies slot", 3, 0, 1, true, true},
+		{"live total limit still enforced", 2, 2, 0, true, true},
+		{"legacy accounting unchanged", 1, 0, 0, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id := protocol.NewDeviceID([]byte("reconnect"))
+			cfg := config.New(protocol.LocalDeviceID)
+			cfg.Devices = append(cfg.Devices, config.DeviceConfiguration{DeviceID: id, RawNumConnections: tc.limit})
+			s := &service{cfg: config.Wrap("", cfg, protocol.LocalDeviceID, events.NoopLogger)}
+			s.options.SingleWANConnection = func() bool { return tc.active }
+			s.wantConnections = map[protocol.DeviceID]int{id: tc.limit}
+			dead := &wanLimitTestConnection{id: "dead", priority: 50, done: make(chan struct{}), started: make(chan struct{})}
+			close(dead.done)
+			group := []protocol.Connection{dead}
+			for i := 0; i < tc.lan; i++ {
+				group = append(group, nativePolicyConnection{local: true, priority: 50})
+			}
+			for i := 0; i < tc.wan; i++ {
+				group = append(group, nativePolicyConnection{priority: 50})
+			}
+			s.connections = map[protocol.DeviceID][]protocol.Connection{id: group}
+			// The release callback is blocked: keep the closed connection in
+			// the resource tracker throughout repeated admission snapshots.
+			for i := 0; i < 2; i++ {
+				err := s.connectionCheckEarly(id, internalConn{priority: 50})
+				if errors.Is(err, errDeviceAlreadyConnected) != tc.reject {
+					t.Fatalf("admission=%v want rejection=%v", err, tc.reject)
+				}
+				if got := s.numConnectionsForDevice(id); got != len(group) {
+					t.Fatalf("resources released early: %d", got)
+				}
+				count, _, _, _ := s.admissionConnections(id)
+				want := len(group)
+				if tc.active {
+					want--
+				}
+				if count != want {
+					t.Fatalf("dial/admission snapshot=%d want=%d", count, want)
+				}
+			}
+			if !tc.reject {
+				// A successful replacement must immediately occupy the live WAN
+				// slot, even though the old resource is still charged.
+				s.connections[id] = append(s.connections[id], nativePolicyConnection{priority: 50})
+				if err := s.connectionCheckEarly(id, internalConn{priority: 50}); !errors.Is(err, errDeviceAlreadyConnected) {
+					t.Fatalf("second replacement accepted: %v", err)
+				}
+				if got := s.numConnectionsForDevice(id); got != len(group)+1 {
+					t.Fatalf("old resource dropped: %d", got)
+				}
+			}
+		})
 	}
 }
