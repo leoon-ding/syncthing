@@ -7,6 +7,7 @@
 package model
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -24,6 +25,7 @@ import (
 // A sharedPullerState is kept for each file that is being synced and is kept
 // updated along the way.
 type sharedPullerState struct {
+	sources map[protocol.DeviceID]pullSource
 	// Immutable, does not require locking
 	file        protocol.FileInfo // The new file (desired end state)
 	fs          fs.Filesystem
@@ -124,6 +126,9 @@ func (s *sharedPullerState) tempFile() (*lockedWriterAt, error) {
 	s.mut.Lock()
 	defer s.mut.Unlock()
 
+	if s.closed {
+		return nil, ErrFolderAccessClosed
+	}
 	// If we've already hit an error, return early
 	if s.err != nil {
 		return nil, s.err
@@ -329,7 +334,8 @@ func (s *sharedPullerState) finalClose() (bool, error) {
 		// time to do so. This also truncates the file to the correct size
 		// if we're using sparse file.
 		if err := s.addWriterLocked(); err != nil {
-			return false, err
+			s.closed = true
+			return true, err
 		}
 	}
 
@@ -451,4 +457,61 @@ func blocksToSize(blocks, blocksInFile, blockSize int, fileSize int64) int64 {
 		return 0
 	}
 	return int64(blocks)*int64(blockSize) - (int64(blockSize)-fileSize%int64(blockSize))*int64(blocks)/int64(blocksInFile)
+}
+
+type pullSource struct {
+	ctx     context.Context //nolint:containedctx // Source admission survives all blocks through rename and database flush.
+	release func()
+}
+
+// A source borrow spans all blocks from that device through final rename and
+// the database flush. Losing one source fails this attempt, not other folders.
+func (s *sharedPullerState) admitSource(parent context.Context, g *FolderAccess, device protocol.DeviceID) (context.Context, error) {
+	if g == nil {
+		return parent, parent.Err()
+	}
+	s.mut.Lock()
+	defer s.mut.Unlock()
+	if s.closed {
+		return nil, ErrFolderAccessClosed
+	}
+	if source, ok := s.sources[device]; ok {
+		return source.ctx, source.ctx.Err()
+	}
+	ctx, release, err := g.Admit(parent, device, s.folder)
+	if err != nil {
+		return nil, err
+	}
+	if s.sources == nil {
+		s.sources = make(map[protocol.DeviceID]pullSource)
+	}
+	s.sources[device] = pullSource{ctx, release}
+	return ctx, nil
+}
+
+func (s *sharedPullerState) sourceError() error {
+	s.mut.RLock()
+	defer s.mut.RUnlock()
+	for _, source := range s.sources {
+		if err := source.ctx.Err(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *sharedPullerState) releaseSources() {
+	s.mut.Lock()
+	sources := s.sources
+	s.sources = nil
+	s.mut.Unlock()
+	for _, source := range sources {
+		source.release()
+	}
+}
+
+func (s *sharedPullerState) hasSources() bool {
+	s.mut.RLock()
+	defer s.mut.RUnlock()
+	return len(s.sources) > 0
 }

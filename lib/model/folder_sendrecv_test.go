@@ -29,6 +29,7 @@ import (
 	"github.com/syncthing/syncthing/lib/ignore"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/scanner"
+	"github.com/syncthing/syncthing/lib/semaphore"
 )
 
 var blocks = []protocol.BlockInfo{
@@ -1252,4 +1253,17 @@ func startCopier(ctx context.Context, f *sendReceiveFolder, pullChan chan<- pull
 		wg.Done()
 	}()
 	return copyChan, wg
+}
+
+func TestCanceledFolderCannotWriteBlock(t *testing.T) {
+	f := &sendReceiveFolder{writeLimiter: semaphore.New(1)}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	// A nil writer proves canceled results never reach WriteAt.
+	if err := f.limitedWriteAt(ctx, nil, []byte("revoked"), 0); !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	if f.writeLimiter.Available() != 1 {
+		t.Fatal("write quota leaked")
+	}
 }

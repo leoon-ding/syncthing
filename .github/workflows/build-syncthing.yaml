@@ -1128,6 +1128,8 @@ jobs:
   #
 
   govulncheck:
+    # Topic branches are checked by their PR; keep the default branch and manual runs.
+    if: github.event_name != 'push' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
     name: Run govulncheck
     needs:
@@ -1166,6 +1168,7 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v8
         with:
+          version: v2.15.0
           only-new-issues: true
 
   #

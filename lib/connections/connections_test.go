@@ -439,7 +439,7 @@ func withConnectionPair(b interface{ Fatal(...interface{}) }, connUri string, h 
 	}
 	natSvc := nat.NewService(deviceId, wcfg)
 	conns := make(chan internalConn, 1)
-	lanChecker := &lanChecker{wcfg}
+	lanChecker := &lanChecker{cfg: wcfg}
 	listenSvc := lf.New(uri, wcfg, tlsCfg, conns, natSvc, registry.New(), lanChecker)
 	supervisor.Add(listenSvc)
 

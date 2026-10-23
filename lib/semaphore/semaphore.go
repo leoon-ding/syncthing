@@ -31,19 +31,9 @@ func New(max int) *Semaphore {
 }
 
 func (s *Semaphore) TakeWithContext(ctx context.Context, size int) error {
-	done := make(chan struct{})
-	var err error
-	go func() {
-		err = s.takeInner(ctx, size)
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-ctx.Done():
-		s.cond.Broadcast()
-		<-done
-	}
-	return err
+	stop := context.AfterFunc(ctx, func() { s.mut.Lock(); s.cond.Broadcast(); s.mut.Unlock() })
+	defer stop()
+	return s.takeInner(ctx, size)
 }
 
 func (s *Semaphore) Take(size int) {
@@ -63,6 +53,9 @@ func (s *Semaphore) takeInner(ctx context.Context, size int) error {
 		size = s.max
 	}
 	for size > s.available {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		s.cond.Wait()
 		select {
 		case <-ctx.Done():
@@ -120,9 +113,10 @@ func (s *Semaphore) Available() int {
 type MultiSemaphore []*Semaphore
 
 func (s MultiSemaphore) TakeWithContext(ctx context.Context, size int) error {
-	for _, limiter := range s {
+	for i, limiter := range s {
 		if limiter != nil {
 			if err := limiter.TakeWithContext(ctx, size); err != nil {
+				s[:i].Give(size)
 				return err
 			}
 		}

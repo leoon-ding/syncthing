@@ -307,11 +307,19 @@ func (t *ProgressEmitter) emptyLocked() bool {
 	return true
 }
 
-func (t *ProgressEmitter) temporaryIndexSubscribe(conn protocol.Connection, folders []string) {
+func (t *ProgressEmitter) temporaryIndexSubscribe(conn protocol.Connection, folders []string, withheld map[string]struct{}) {
 	t.mut.Lock()
 	defer t.mut.Unlock()
+	// Preserve only existing subscriptions for locally withheld announcements.
+	// Never grant a new subscription from an inadmissible payload.
+	merged := append([]string(nil), folders...)
+	for _, folder := range t.foldersByConns[conn.DeviceID()] {
+		if _, keep := withheld[folder]; keep {
+			merged = append(merged, folder)
+		}
+	}
 	t.connections[conn.DeviceID()] = conn
-	t.foldersByConns[conn.DeviceID()] = folders
+	t.foldersByConns[conn.DeviceID()] = merged
 }
 
 func (t *ProgressEmitter) temporaryIndexUnsubscribe(conn protocol.Connection) {

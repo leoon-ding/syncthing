@@ -132,9 +132,12 @@ func setupModelWithConnectionFromWrapper(t testing.TB, w config.Wrapper) (*testM
 	return m, fc
 }
 
-func setupModel(t testing.TB, w config.Wrapper) *testModel {
+func setupModel(t testing.TB, w config.Wrapper, access ...*FolderAccess) *testModel {
 	t.Helper()
 	m := newModel(t, w, myID, nil)
+	if len(access) > 0 {
+		m.folderAccess = access[0]
+	}
 	m.ServeBackground()
 	<-m.started
 

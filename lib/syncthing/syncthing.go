@@ -52,11 +52,13 @@ const (
 )
 
 type Options struct {
+	FolderAccess          *model.FolderAccess
 	AuditWriter           io.Writer
 	NoUpgrade             bool
 	ProfilerAddr          string
 	ResetDeltaIdxs        bool
 	DBMaintenanceInterval time.Duration
+	ConnectionOptions     connections.Options
 }
 
 type App struct {
@@ -252,7 +254,7 @@ func (a *App) startup() error {
 	}
 
 	keyGen := protocol.NewKeyGenerator()
-	m := model.NewModel(a.cfg, a.myID, a.sdb, protectedFiles, a.evLogger, keyGen)
+	m := model.NewModel(a.cfg, a.myID, a.sdb, protectedFiles, a.evLogger, keyGen, a.opts.FolderAccess)
 	a.Internals = newInternals(m)
 
 	a.mainService.Add(m)
@@ -276,10 +278,12 @@ func (a *App) startup() error {
 
 	connRegistry := registry.New()
 	discoveryManager := discover.NewManager(a.myID, a.cfg, a.cert, a.evLogger, addrLister, connRegistry)
-	connectionsService := connections.NewService(a.cfg, a.myID, m, tlsCfg, discoveryManager, bepProtocolName, tlsDefaultCommonName, a.evLogger, connRegistry, keyGen)
+	connectionsService := connections.NewService(a.cfg, a.myID, m, tlsCfg, discoveryManager, bepProtocolName, tlsDefaultCommonName, a.evLogger, connRegistry, keyGen, a.opts.ConnectionOptions)
 
 	addrLister.AddressLister = connectionsService
 
+	a.Internals.connections = connectionsService
+	a.Internals.quiesce = connectionsService.Quiesce
 	a.mainService.Add(discoveryManager)
 	a.mainService.Add(connectionsService)
 

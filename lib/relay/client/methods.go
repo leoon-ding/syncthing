@@ -28,6 +28,19 @@ func (e *incorrectResponseCodeErr) Error() string {
 }
 
 func GetInvitationFromRelay(ctx context.Context, uri *url.URL, id syncthingprotocol.DeviceID, certs []tls.Certificate, timeout time.Duration) (protocol.SessionInvitation, error) {
+	return getInvitation(ctx, uri, certs, timeout, protocol.ConnectRequest{ID: id[:]}, protocol.ProtocolName)
+}
+
+// GetPrivateInvitationFromRelay uses pair authorization over the separate
+// authenticated control protocol. Legacy relay control is never a fallback.
+func GetPrivateInvitationFromRelay(ctx context.Context, uri *url.URL, certs []tls.Certificate, token protocol.PermitToken, timeout time.Duration) (protocol.SessionInvitation, error) {
+	if uri == nil || uri.Query().Get("id") == "" || uri.Query().Get("token") != "" {
+		return protocol.SessionInvitation{}, protocol.ErrPermit
+	}
+	return getInvitation(ctx, uri, certs, timeout, protocol.PrivateConnectRequest{Permit: token}, protocol.ControlledProtocolName)
+}
+
+func getInvitation(ctx context.Context, uri *url.URL, certs []tls.Certificate, timeout time.Duration, request any, alpn string) (protocol.SessionInvitation, error) {
 	if uri.Scheme != "relay" {
 		return protocol.SessionInvitation{}, fmt.Errorf("unsupported relay scheme: %v", uri.Scheme)
 	}
@@ -39,18 +52,19 @@ func GetInvitationFromRelay(ctx context.Context, uri *url.URL, id syncthingproto
 		return protocol.SessionInvitation{}, err
 	}
 
-	conn := tls.Client(rconn, configForCerts(certs))
+	defer rconn.Close()
+	stopCancel := context.AfterFunc(ctx, func() { rconn.Close() })
+	defer stopCancel()
+	cfg := configForCerts(certs)
+	cfg.NextProtos = []string{alpn}
+	conn := tls.Client(rconn, cfg)
 	conn.SetDeadline(time.Now().Add(timeout))
 
-	if err := performHandshakeAndValidation(conn, uri); err != nil {
+	if err := performHandshakeProtocol(conn, uri, alpn); err != nil {
 		return protocol.SessionInvitation{}, err
 	}
 
 	defer conn.Close()
-
-	request := protocol.ConnectRequest{
-		ID: id[:],
-	}
 
 	if err := protocol.WriteMessage(conn, request); err != nil {
 		return protocol.SessionInvitation{}, err
@@ -86,6 +100,18 @@ func JoinSession(ctx context.Context, invitation protocol.SessionInvitation) (ne
 		return nil, err
 	}
 
+	transferred := false
+	closed := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() { conn.Close(); close(closed) })
+	defer func() {
+		if !stop() {
+			<-closed
+		}
+		if !transferred || ctx.Err() != nil {
+			conn.Close()
+		}
+	}()
+
 	request := protocol.JoinSessionRequest{
 		Key: invitation.Key,
 	}
@@ -108,6 +134,10 @@ func JoinSession(ctx context.Context, invitation protocol.SessionInvitation) (ne
 		if msg.Code != 0 {
 			return nil, fmt.Errorf("incorrect response code %d: %s", msg.Code, msg.Message)
 		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		transferred = true
 		return conn, nil
 	default:
 		return nil, fmt.Errorf("protocol error: expecting response got %v", msg)

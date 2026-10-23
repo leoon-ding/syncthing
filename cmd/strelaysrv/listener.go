@@ -28,6 +28,10 @@ func listener(_, addr string, config *tls.Config, token string) {
 		log.Fatalln(err)
 	}
 
+	if controlledRelay != nil {
+		controlledRelay.listen(tcpListener, config)
+		return
+	}
 	listener := tlsutil.DowngradingListener{
 		Listener: tcpListener,
 	}
@@ -304,8 +308,16 @@ func protocolConnectionHandler(tcpConn net.Conn, config *tls.Config, token strin
 	}
 }
 
-func sessionConnectionHandler(conn net.Conn) {
-	if err := conn.SetDeadline(time.Now().Add(messageTimeout)); err != nil {
+func sessionConnectionHandler(conn net.Conn) { sessionConnectionHandlerTimeout(conn, messageTimeout) }
+
+func sessionConnectionHandlerTimeout(conn net.Conn, timeout time.Duration) {
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			conn.Close()
+		}
+	}()
+	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
 		if debug {
 			log.Println("Weird error setting deadline:", err, "on", conn.RemoteAddr())
 		}
@@ -341,6 +353,9 @@ func sessionConnectionHandler(conn net.Conn) {
 		}
 
 		if err := protocol.WriteMessage(conn, protocol.ResponseSuccess); err != nil {
+			if ses.onDone != nil {
+				ses.abort()
+			}
 			if debug {
 				log.Println("Failed to send session join response to ", conn.RemoteAddr(), "for", ses)
 			}
@@ -348,6 +363,9 @@ func sessionConnectionHandler(conn net.Conn) {
 		}
 
 		if err := conn.SetDeadline(time.Time{}); err != nil {
+			if ses.onDone != nil {
+				ses.abort()
+			}
 			if debug {
 				log.Println("Weird error setting deadline:", err, "on", conn.RemoteAddr())
 			}
@@ -355,6 +373,7 @@ func sessionConnectionHandler(conn net.Conn) {
 			return
 		}
 
+		handedOff = true
 	default:
 		if debug {
 			log.Println("Unexpected message from", conn.RemoteAddr(), message)

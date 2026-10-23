@@ -34,3 +34,17 @@ func TestReadOnlyDir(t *testing.T) {
 	s.fail(nil)
 	s.finalClose()
 }
+
+func TestFinalCloseCreationFailureCompletesOnce(t *testing.T) {
+	s := &sharedPullerState{fs: fs.NewFilesystem(fs.FilesystemTypeBasic, t.TempDir()), tempName: "missing/temporary"}
+	closed, err := s.finalClose()
+	if !closed || err == nil {
+		t.Fatalf("close: %v, %v", closed, err)
+	}
+	if closed, _ := s.finalClose(); closed {
+		t.Fatal("duplicate completion")
+	}
+	if _, err := s.tempFile(); err == nil {
+		t.Fatal("reopened finalized file")
+	}
+}

@@ -157,6 +157,8 @@ type ConnectionInfo interface {
 }
 
 type rawConnection struct {
+	folderAdmit       func(context.Context, string) (context.Context, func(), error)
+	announcementAdmit func(context.Context, string, bool) (context.Context, func(), error)
 	ConnectionInfo
 
 	deviceID  DeviceID
@@ -173,12 +175,12 @@ type rawConnection struct {
 	awaiting    map[int]chan asyncResult
 	nextID      int
 
-	idxMut sync.Mutex // ensures serialization of Index calls
+	idxGate chan struct{} // serializes Index calls with cancelable admission
 
 	inbox                 chan proto.Message
 	outbox                chan asyncMessage
 	closeBox              chan asyncMessage
-	clusterConfigBox      chan *ClusterConfig
+	clusterConfigBox      chan clusterConfigMessage
 	dispatcherLoopStopped chan struct{}
 	closed                chan struct{}
 	closeOnce             sync.Once
@@ -196,6 +198,7 @@ type asyncResult struct {
 }
 
 type asyncMessage struct {
+	ctx  context.Context //nolint:containedctx // Queue retains the admission scope until write completion or cancellation.
 	msg  proto.Message
 	done chan struct{} // done closes when we're done sending the message
 }
@@ -214,7 +217,17 @@ const (
 // Should not be modified in production code, just for testing.
 var CloseTimeout = 10 * time.Second
 
-func NewConnection(deviceID DeviceID, reader io.Reader, writer io.Writer, closer io.Closer, model Model, connInfo ConnectionInfo, compress Compression, keyGen *KeyGenerator) Connection {
+func NewConnection(deviceID DeviceID, reader io.Reader, writer io.Writer, closer io.Closer, model Model, connInfo ConnectionInfo, compress Compression, keyGen *KeyGenerator, admission ...func(context.Context, string) (context.Context, func(), error)) Connection {
+	return newConnection(deviceID, reader, writer, closer, model, connInfo, compress, keyGen, nil, admission...)
+}
+
+// NewConnectionWithAnnouncement separates configuration metadata admission from
+// data admission. Both callbacks must retain revocation scopes until send completes.
+func NewConnectionWithAnnouncement(deviceID DeviceID, reader io.Reader, writer io.Writer, closer io.Closer, model Model, connInfo ConnectionInfo, compress Compression, keyGen *KeyGenerator, announce func(context.Context, string, bool) (context.Context, func(), error), admission func(context.Context, string) (context.Context, func(), error)) Connection {
+	return newConnection(deviceID, reader, writer, closer, model, connInfo, compress, keyGen, announce, admission)
+}
+
+func newConnection(deviceID DeviceID, reader io.Reader, writer io.Writer, closer io.Closer, model Model, connInfo ConnectionInfo, compress Compression, keyGen *KeyGenerator, announce func(context.Context, string, bool) (context.Context, func(), error), admission ...func(context.Context, string) (context.Context, func(), error)) Connection {
 	// We create the wrapper for the model first, as it needs to be passed
 	// in at the lowest level in the stack. At the end of construction,
 	// before returning, we add the connection to cwm so that it can be used
@@ -229,6 +242,10 @@ func NewConnection(deviceID DeviceID, reader io.Reader, writer io.Writer, closer
 	// We do the wire format conversion first (outermost) so that the
 	// metadata is in wire format when it reaches the encryption step.
 	rc := newRawConnection(deviceID, reader, writer, closer, em, connInfo, compress)
+	if len(admission) > 0 {
+		rc.folderAdmit = admission[0]
+	}
+	rc.announcementAdmit = announce
 	ec := newEncryptedConnection(rc, rc, em.folderKeys, keyGen)
 	wc := wireFormatConnection{ec}
 
@@ -255,7 +272,8 @@ func newRawConnection(deviceID DeviceID, reader io.Reader, writer io.Writer, clo
 		inbox:                 make(chan proto.Message),
 		outbox:                make(chan asyncMessage),
 		closeBox:              make(chan asyncMessage),
-		clusterConfigBox:      make(chan *ClusterConfig),
+		clusterConfigBox:      make(chan clusterConfigMessage),
+		idxGate:               make(chan struct{}, 1),
 		dispatcherLoopStopped: make(chan struct{}),
 		closed:                make(chan struct{}),
 		compression:           compress,
@@ -315,6 +333,30 @@ func (c *rawConnection) DeviceID() DeviceID {
 	return c.deviceID
 }
 
+// lockIndex lets an unsent folder request leave the shared queue on revoke
+// or connection shutdown. Once writing starts, the caller retains the slot
+// and admission until the writer reports actual completion.
+func (c *rawConnection) lockIndex(ctx context.Context) error {
+	select {
+	case c.idxGate <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.closed:
+		return ErrClosed
+	}
+	// Acquiring a free slot may race cancellation; do not send stale work.
+	select {
+	case <-ctx.Done():
+		<-c.idxGate
+		return ctx.Err()
+	case <-c.closed:
+		<-c.idxGate
+		return ErrClosed
+	default:
+		return nil
+	}
+}
+
 // Index writes the list of file information to the connected peer device
 func (c *rawConnection) Index(ctx context.Context, idx *Index) error {
 	select {
@@ -324,9 +366,26 @@ func (c *rawConnection) Index(ctx context.Context, idx *Index) error {
 		return ctx.Err()
 	default:
 	}
-	c.idxMut.Lock()
+	if c.folderAdmit != nil {
+		scope, release, err := c.folderAdmit(ctx, idx.Folder)
+		if err != nil {
+			return err
+		}
+		defer release()
+		if err := c.lockIndex(scope); err != nil {
+			return err
+		}
+		defer func() { <-c.idxGate }()
+		done := make(chan struct{})
+		c.send(scope, idx.toWire(), done)
+		<-done
+		return scope.Err()
+	}
+	if err := c.lockIndex(ctx); err != nil {
+		return err
+	}
+	defer func() { <-c.idxGate }()
 	c.send(ctx, idx.toWire(), nil)
-	c.idxMut.Unlock()
 	return nil
 }
 
@@ -339,14 +398,40 @@ func (c *rawConnection) IndexUpdate(ctx context.Context, idxUp *IndexUpdate) err
 		return ctx.Err()
 	default:
 	}
-	c.idxMut.Lock()
+	if c.folderAdmit != nil {
+		scope, release, err := c.folderAdmit(ctx, idxUp.Folder)
+		if err != nil {
+			return err
+		}
+		defer release()
+		if err := c.lockIndex(scope); err != nil {
+			return err
+		}
+		defer func() { <-c.idxGate }()
+		done := make(chan struct{})
+		c.send(scope, idxUp.toWire(), done)
+		<-done
+		return scope.Err()
+	}
+	if err := c.lockIndex(ctx); err != nil {
+		return err
+	}
+	defer func() { <-c.idxGate }()
 	c.send(ctx, idxUp.toWire(), nil)
-	c.idxMut.Unlock()
 	return nil
 }
 
 // Request returns the bytes for the specified block after fetching them from the connected peer.
 func (c *rawConnection) Request(ctx context.Context, req *Request) ([]byte, error) {
+	if c.folderAdmit != nil {
+		scope, release, err := c.folderAdmit(ctx, req.Folder)
+		if err != nil {
+			return nil, err
+		}
+		defer release()
+		ctx = scope
+	}
+
 	select {
 	case <-c.closed:
 		return nil, ErrClosed
@@ -366,6 +451,14 @@ func (c *rawConnection) Request(ctx context.Context, req *Request) ([]byte, erro
 	}
 	c.awaiting[id] = rc
 	c.awaitingMut.Unlock()
+	// Cancellation can end a request before it is sent or answered. Retire its
+	// registration under the same lock used by responses and connection close.
+	// Those paths own channel closure; an abandoned receiver need not close it.
+	defer func() {
+		c.awaitingMut.Lock()
+		delete(c.awaiting, id)
+		c.awaitingMut.Unlock()
+	}()
 
 	req.ID = id
 	ok := c.send(ctx, req.toWire(), nil)
@@ -385,11 +478,76 @@ func (c *rawConnection) Request(ctx context.Context, req *Request) ([]byte, erro
 }
 
 // ClusterConfig sends the cluster configuration message to the peer.
+type clusterConfigMessage struct {
+	config   *ClusterConfig
+	scopes   []context.Context
+	releases []func()
+	done     chan struct{}
+}
+
 func (c *rawConnection) ClusterConfig(config *ClusterConfig, _ map[string]string) {
+	snapshot := *config
+	snapshot.Folders = nil
+	message := clusterConfigMessage{config: &snapshot, done: make(chan struct{})}
+	enqueueCtx := context.Background()
+	defer func() {
+		for _, release := range message.releases {
+			release()
+		}
+	}()
+	if c.folderAdmit == nil && c.announcementAdmit == nil {
+		snapshot.Folders = config.Folders
+	} else {
+		var cancelEnqueue context.CancelFunc
+		enqueueCtx, cancelEnqueue = context.WithCancel(enqueueCtx)
+		defer cancelEnqueue()
+		for _, folder := range config.Folders {
+			var scope context.Context
+			var release func()
+			var err error
+			if c.announcementAdmit != nil {
+				scope, release, err = c.announcementAdmit(context.Background(), folder.ID, folder.StopReason == FolderStopReasonPaused)
+			} else {
+				scope, release, err = c.folderAdmit(context.Background(), folder.ID)
+			}
+			if err != nil {
+				return
+			}
+			snapshot.Folders = append(snapshot.Folders, folder)
+			message.scopes = append(message.scopes, scope)
+			message.releases = append(message.releases, release)
+			stop := context.AfterFunc(scope, cancelEnqueue)
+			defer stop()
+			if scope.Err() != nil {
+				return
+			}
+		}
+	}
+	// Cancellation only withdraws an unsent snapshot. Once accepted, the
+	// writer owns completion; retain every borrow until it writes or discards it.
+	if enqueueCtx.Err() != nil {
+		return
+	}
 	select {
-	case c.clusterConfigBox <- config:
+	case <-enqueueCtx.Done():
+	case c.clusterConfigBox <- message:
+		if c.folderAdmit != nil || c.announcementAdmit != nil {
+			<-message.done
+		}
 	case <-c.closed:
 	}
+}
+
+// A partial ClusterConfig would falsely withdraw fenced folders. Drop the
+// entire stale snapshot; the embedding model regenerates it after reopening.
+func (c *rawConnection) writeClusterConfig(message clusterConfigMessage) (bool, error) {
+	defer close(message.done)
+	for _, scope := range message.scopes {
+		if scope.Err() != nil {
+			return false, nil
+		}
+	}
+	return true, c.writeMessage(message.config.toWire())
 }
 
 func (c *rawConnection) Closed() <-chan struct{} {
@@ -398,6 +556,17 @@ func (c *rawConnection) Closed() <-chan struct{} {
 
 // DownloadProgress sends the progress updates for the files that are currently being downloaded.
 func (c *rawConnection) DownloadProgress(ctx context.Context, dp *DownloadProgress) {
+	if c.folderAdmit != nil {
+		scope, release, err := c.folderAdmit(ctx, dp.Folder)
+		if err != nil {
+			return
+		}
+		defer release()
+		done := make(chan struct{})
+		c.send(scope, dp.toWire(), done)
+		<-done
+		return
+	}
 	c.send(ctx, dp.toWire(), nil)
 }
 
@@ -685,7 +854,15 @@ func (c *rawConnection) handleRequest(req *Request) {
 		Data: res.Data(),
 		Code: errorToCode(nil),
 	}
-	c.send(context.Background(), resp.toWire(), done)
+	ctx := context.Background()
+	if scoped, ok := res.(interface{ Context() context.Context }); ok {
+		ctx = scoped.Context()
+	}
+	if !c.send(ctx, resp.toWire(), done) && ctx.Err() != nil {
+		res.Close()
+		c.send(context.Background(), (&Response{ID: req.ID, Code: errorToCode(ErrGeneric)}).toWire(), nil)
+		return
+	}
 	<-done
 	res.Close()
 }
@@ -702,7 +879,7 @@ func (c *rawConnection) handleResponse(resp *Response) {
 
 func (c *rawConnection) send(ctx context.Context, msg proto.Message, done chan struct{}) bool {
 	select {
-	case c.outbox <- asyncMessage{msg, done}:
+	case c.outbox <- asyncMessage{msg: msg, done: done, ctx: ctx}:
 		return true
 	case <-c.closed:
 	case <-ctx.Done():
@@ -714,20 +891,27 @@ func (c *rawConnection) send(ctx context.Context, msg proto.Message, done chan s
 }
 
 func (c *rawConnection) writerLoop() {
-	select {
-	case cc := <-c.clusterConfigBox:
-		err := c.writeMessage(cc.toWire())
-		if err != nil {
-			c.internalClose(err)
+initial:
+	for {
+		select {
+		case cc := <-c.clusterConfigBox:
+			written, err := c.writeClusterConfig(cc)
+			if err != nil {
+				c.internalClose(err)
+				return
+			}
+			if written {
+				break initial
+			}
+		case hm := <-c.closeBox:
+			_ = c.writeMessage(hm.msg)
+			close(hm.done)
+			return
+		case <-c.closed:
 			return
 		}
-	case hm := <-c.closeBox:
-		_ = c.writeMessage(hm.msg)
-		close(hm.done)
-		return
-	case <-c.closed:
-		return
 	}
+
 	for {
 		// When the connection is closing or closed, that should happen
 		// immediately, not compete with the (potentially very busy) outbox.
@@ -742,12 +926,22 @@ func (c *rawConnection) writerLoop() {
 		}
 		select {
 		case cc := <-c.clusterConfigBox:
-			err := c.writeMessage(cc.toWire())
+			_, err := c.writeClusterConfig(cc)
 			if err != nil {
 				c.internalClose(err)
 				return
 			}
 		case hm := <-c.outbox:
+			if hm.ctx != nil && hm.ctx.Err() != nil {
+				if response, ok := hm.msg.(*bep.Response); ok {
+					hm.msg = (&Response{ID: int(response.Id), Code: errorToCode(ErrGeneric)}).toWire()
+				} else {
+					if hm.done != nil {
+						close(hm.done)
+					}
+					continue
+				}
+			}
 			err := c.writeMessage(hm.msg)
 			if hm.done != nil {
 				close(hm.done)
@@ -960,7 +1154,7 @@ func (c *rawConnection) Close(err error) {
 		timeout := time.NewTimer(CloseTimeout)
 		defer timeout.Stop()
 		select {
-		case c.closeBox <- asyncMessage{&bep.Close{Reason: err.Error()}, done}:
+		case c.closeBox <- asyncMessage{msg: &bep.Close{Reason: err.Error()}, done: done}:
 			select {
 			case <-done:
 			case <-timeout.C:

@@ -51,7 +51,9 @@ func newSession(serverid, clientid syncthingprotocol.DeviceID, sessionLimitBps i
 		clientid:  clientid,
 		rateLimit: makeRateLimitFunc(sessionRateLimit, globalRateLimit),
 		limiter:   sessionRateLimit,
-		connsChan: make(chan net.Conn),
+		connsChan: make(chan net.Conn, 2),
+		stop:      make(chan struct{}),
+		done:      make(chan struct{}),
 		conns:     make([]net.Conn, 0, 2),
 	}
 
@@ -105,7 +107,12 @@ func hasSessions(id syncthingprotocol.DeviceID) bool {
 }
 
 type session struct {
-	mut sync.Mutex
+	joinDeadline time.Time
+	stop         chan struct{}
+	done         chan struct{}
+	stopOnce     sync.Once
+	onDone       func()
+	mut          sync.Mutex
 
 	serverkey []byte
 	serverid  syncthingprotocol.DeviceID
@@ -118,6 +125,7 @@ type session struct {
 
 	connsChan chan net.Conn
 	conns     []net.Conn
+	closing   bool
 }
 
 func (s *session) AddConnection(conn net.Conn) bool {
@@ -125,33 +133,62 @@ func (s *session) AddConnection(conn net.Conn) bool {
 		log.Println("New connection for", s, "from", conn.RemoteAddr())
 	}
 
+	// Own accepted sockets before notifying Serve. Scheduling the receiver must
+	// not decide whether a valid invitation can join; the two slots are bounded.
+	s.mut.Lock()
+	defer s.mut.Unlock()
+	if s.closing || len(s.conns) >= 2 || !s.joinDeadline.IsZero() && !time.Now().Before(s.joinDeadline) {
+		return false
+	}
 	select {
-	case s.connsChan <- conn:
-		return true
+	case <-s.done:
+		return false
+	case <-s.stop:
+		return false
 	default:
 	}
-	return false
+	s.conns = append(s.conns, conn)
+	s.connsChan <- conn
+	return true
 }
 
+func (s *session) abort() { s.stopOnce.Do(func() { close(s.stop) }); s.CloseConns() }
 func (s *session) Serve() {
-	timedout := time.After(messageTimeout)
+	defer close(s.done)
+	if s.onDone != nil {
+		defer s.onDone()
+	}
+
+	wait := messageTimeout
+	if !s.joinDeadline.IsZero() {
+		wait = time.Until(s.joinDeadline)
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	timedout := timer.C
 
 	if debug {
 		log.Println("Session", s, "serving")
 	}
 
+	joined := 0
 	for {
 		select {
-		case conn := <-s.connsChan:
+		case <-s.connsChan:
 			s.mut.Lock()
-			s.conns = append(s.conns, conn)
+			select {
+			case <-s.stop:
+				s.mut.Unlock()
+				goto done
+			default:
+			}
+			joined++
 			s.mut.Unlock()
-			// We're the only ones mutating s.conns, hence we are free to read it.
-			if len(s.conns) < 2 {
+			// Both socket assignments precede their notifications. Once both
+			// arrive, AddConnection cannot change the full two-entry slice.
+			if joined < 2 {
 				continue
 			}
-
-			close(s.connsChan)
 
 			if debug {
 				log.Println("Session", s, "starting between", s.conns[0].RemoteAddr(), "and", s.conns[1].RemoteAddr())
@@ -163,12 +200,18 @@ func (s *session) Serve() {
 			var err0 error
 			go func() {
 				err0 = s.proxy(s.conns[0], s.conns[1])
+				if s.onDone != nil {
+					s.CloseConns()
+				}
 				wg.Done()
 			}()
 
 			var err1 error
 			go func() {
 				err1 = s.proxy(s.conns[1], s.conns[0])
+				if s.onDone != nil {
+					s.CloseConns()
+				}
 				wg.Done()
 			}()
 
@@ -183,6 +226,8 @@ func (s *session) Serve() {
 			}
 			goto done
 
+		case <-s.stop:
+			goto done
 		case <-timedout:
 			if debug {
 				log.Println("Session", s, "timed out")
@@ -245,6 +290,7 @@ func (s *session) HasParticipant(id syncthingprotocol.DeviceID) bool {
 
 func (s *session) CloseConns() {
 	s.mut.Lock()
+	s.closing = true
 	for _, conn := range s.conns {
 		conn.Close()
 	}

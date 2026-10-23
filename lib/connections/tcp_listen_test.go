@@ -49,7 +49,7 @@ func TestTCPListenerConnectionHandoff(t *testing.T) {
 			}
 			uri, _ := url.Parse("tcp://" + addr)
 			conns := make(chan internalConn)
-			listener := (&tcpListenerFactory{}).New(uri, cfg, tlsCfg, conns, nat.NewService(id, cfg), registry.New(), &lanChecker{cfg}).(*tcpListener)
+			listener := (&tcpListenerFactory{}).New(uri, cfg, tlsCfg, conns, nat.NewService(id, cfg), registry.New(), &lanChecker{cfg: cfg}).(*tcpListener)
 			addresses := make(chan string, 1)
 			listener.OnAddressesChanged(func(a ListenerAddresses) {
 				if len(a.LANAddresses) > 0 {

@@ -30,6 +30,12 @@ func WriteMessage(w io.Writer, message interface{}) error {
 	var err error
 
 	switch msg := message.(type) {
+	case PrivateJoinRequest:
+		payload, err = permitPayload(msg.Permit)
+		header.messageType = messageTypePrivateJoin
+	case PrivateConnectRequest:
+		payload, err = permitPayload(msg.Permit)
+		header.messageType = messageTypePrivateConnect
 	case Ping:
 		payload, err = msg.MarshalXDR()
 		header.messageType = messageTypePing
@@ -88,7 +94,11 @@ func ReadMessage(r io.Reader) (interface{}, error) {
 	if header.magic != magic {
 		return nil, errors.New("magic mismatch")
 	}
-	if header.messageLength < 0 || header.messageLength > 1024 {
+	limit := int32(1024)
+	if header.messageType == messageTypePrivateJoin || header.messageType == messageTypePrivateConnect {
+		limit = 4096
+	}
+	if header.messageLength < 0 || header.messageLength > limit {
 		return nil, fmt.Errorf("bad length (%d)", header.messageLength)
 	}
 
@@ -98,6 +108,16 @@ func ReadMessage(r io.Reader) (interface{}, error) {
 	}
 
 	switch header.messageType {
+	case messageTypePrivateJoin:
+		if _, err := permitPayload(PermitToken(buf)); err != nil {
+			return nil, err
+		}
+		return PrivateJoinRequest{Permit: PermitToken(buf)}, nil
+	case messageTypePrivateConnect:
+		if _, err := permitPayload(PermitToken(buf)); err != nil {
+			return nil, err
+		}
+		return PrivateConnectRequest{Permit: PermitToken(buf)}, nil
 	case messageTypePing:
 		var msg Ping
 		err := msg.UnmarshalXDR(buf)
