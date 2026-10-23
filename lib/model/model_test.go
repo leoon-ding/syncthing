@@ -3650,15 +3650,19 @@ func testConfigChangeTriggersClusterConfigs(t *testing.T, expectFirst, expectSec
 	m.AddConnection(fc2, protocol.Hello{})
 	m.promoteConnections()
 
-	// Initial CCs
+	// A timer-driven promotion may already own the post-lock send actions.
+	// Our promoteConnections call can then return before those callbacks run.
+	// Observe delivery, rather than assuming the call joined another promoter.
+	initialTimeout := time.NewTimer(time.Second)
+	defer initialTimeout.Stop()
 	select {
 	case <-cc1:
-	default:
+	case <-initialTimeout.C:
 		t.Fatal("missing initial CC from device1")
 	}
 	select {
 	case <-cc2:
-	default:
+	case <-initialTimeout.C:
 		t.Fatal("missing initial CC from device2")
 	}
 
@@ -4478,5 +4482,54 @@ func TestIntroducerWithheldFolderIsolationAndRecovery(t *testing.T) {
 			checkShare("B", fresh, false)
 			checkDevice(fresh, false)
 		})
+	}
+}
+
+func TestConcurrentPromotionInitialClusterConfigDelivery(t *testing.T) {
+	cfg, _ := newDefaultCfgWrapper(t)
+	m := setupModel(t, cfg)
+	defer cleanupModel(m)
+	entered, release := make(chan struct{}), make(chan struct{})
+	notified := make(chan struct{}, 2)
+	conn := newFakeConnection(device1, m)
+	var once sync.Once
+	conn.ClusterConfigCalls(func(*protocol.ClusterConfig, map[string]string) {
+		once.Do(func() { close(entered) })
+		<-release
+		notified <- struct{}{}
+	})
+	m.AddConnection(conn, protocol.Hello{})
+	firstDone := make(chan struct{})
+	secondDone := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	defer func() { unblock(); <-firstDone; <-secondDone }()
+	go func() { defer close(firstDone); m.promoteConnections() }()
+	go func() {
+		defer close(secondDone)
+		<-entered
+		m.promoteConnections()
+	}()
+	select {
+	case <-secondDone:
+	case <-time.After(time.Second):
+		t.Fatal("second promotion blocked on an unrelated send")
+	}
+	// This is exactly the old test's observation window: the promotion marker
+	// is set, the second call returned, but the first sender has not delivered.
+	select {
+	case <-notified:
+		t.Fatal("notification escaped the send barrier")
+	default:
+	}
+	unblock()
+	select {
+	case <-notified:
+	case <-time.After(time.Second):
+		t.Fatal("initial config was lost")
+	}
+	<-firstDone
+	if got := conn.ClusterConfigCallCount(); got != 1 {
+		t.Fatalf("duplicate initial config: %d calls", got)
 	}
 }
