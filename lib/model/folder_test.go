@@ -7,14 +7,19 @@
 package model
 
 import (
+	"context"
+	"log/slog"
 	"path/filepath"
 	"slices"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/d4l3k/messagediff"
 
 	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/config"
+	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/fs"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/rand"
@@ -181,5 +186,146 @@ func TestSetPlatformData(t *testing.T) {
 
 	if err := sr.setPlatformData(fi, "file.tmp"); err != nil {
 		t.Error(err)
+	}
+}
+
+// watchBarrierFilesystem holds each monitor inside Watch until explicitly
+// released, so replacing the folder channel does not depend on scheduling.
+type watchBarrierFilesystem struct {
+	fs.Filesystem
+	started    chan watchBarrierCall
+	successful atomic.Int32
+}
+
+type watchBarrierCall struct {
+	release chan struct{}
+	events  chan fs.Event
+}
+
+func (f *watchBarrierFilesystem) Watch(_ string, _ fs.Matcher, ctx context.Context, _ bool) (<-chan fs.Event, <-chan error, error) {
+	call := watchBarrierCall{release: make(chan struct{}), events: make(chan fs.Event)}
+	select {
+	case f.started <- call:
+	case <-ctx.Done():
+		return nil, nil, ctx.Err()
+	}
+	select {
+	case <-call.release:
+		f.successful.Add(1)
+		return call.events, nil, nil
+	case <-ctx.Done():
+		return nil, nil, ctx.Err()
+	}
+}
+
+// Each successful Watch starts one aggregator. Its final configuration
+// unsubscribe is the completion boundary available to the monitor's consumer.
+type watchBarrierConfig struct {
+	config.Wrapper
+	stopped chan struct{}
+}
+
+func (c *watchBarrierConfig) Unsubscribe(committer config.Committer) {
+	c.Wrapper.Unsubscribe(committer)
+	c.stopped <- struct{}{}
+}
+
+func TestWatchMonitorKeepsGenerationChannel(t *testing.T) {
+	for _, cancelPending := range []bool{false, true} {
+		name := "generation channels"
+		if cancelPending {
+			name = "cancel pending watches"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			watchFS := &watchBarrierFilesystem{started: make(chan watchBarrierCall)}
+			cfg := &watchBarrierConfig{
+				Wrapper: config.Wrap("", config.New(protocol.LocalDeviceID), protocol.LocalDeviceID, events.NoopLogger),
+				stopped: make(chan struct{}, 2),
+			}
+			f := &folder{
+				FolderConfiguration: config.FolderConfiguration{ID: "watch-generation"},
+				model:               &model{cfg: cfg},
+				stateTracker:        newStateTracker("watch-generation", events.NoopLogger),
+				mtimefs:             watchFS,
+				sl:                  slog.Default(),
+				// There is no folder Serve loop in this test. Buffer scan requests
+				// from monitors whose pending Watch calls return cancellation errors.
+				scanDelay: make(chan time.Duration, 2),
+			}
+			var monitors []<-chan struct{}
+			t.Cleanup(func() {
+				cancel()
+				deadline := time.NewTimer(5 * time.Second)
+				defer deadline.Stop()
+				for _, done := range monitors {
+					select {
+					case <-done:
+					case <-deadline.C:
+						t.Error("watch monitor did not exit after cancellation")
+						return
+					}
+				}
+				// Monitor completion guarantees all successful Watch calls have launched
+				// their aggregators, even if those goroutines have not been scheduled yet.
+				for remaining := watchFS.successful.Load(); remaining > 0; remaining-- {
+					select {
+					case <-cfg.stopped:
+					case <-deadline.C:
+						t.Error("watch aggregator did not unsubscribe after cancellation")
+						return
+					}
+				}
+			})
+			startMonitor := func(output chan []string) watchBarrierCall {
+				t.Helper()
+				f.watchChan = output
+				done := make(chan struct{})
+				monitors = append(monitors, done)
+				go func() {
+					defer close(done)
+					f.monitorWatch(ctx, output)
+				}()
+				select {
+				case call := <-watchFS.started:
+					return call
+				case <-ctx.Done():
+					t.Fatal("monitor did not enter Watch:", ctx.Err())
+					return watchBarrierCall{}
+				}
+			}
+
+			firstOutput := make(chan []string)
+			first := startMonitor(firstOutput)
+			// Keep the old context live so misrouted events are observable. A real
+			// restart cancels it, but cannot join a monitor still returning from Watch.
+			secondOutput := make(chan []string)
+			second := startMonitor(secondOutput)
+			if cancelPending {
+				return // Cleanup must join both monitors still blocked in Watch.
+			}
+
+			checkOutput := func(call watchBarrierCall, name string, want, wrong <-chan []string) {
+				t.Helper()
+				close(call.release)
+				select {
+				case call.events <- fs.Event{Name: name, Type: fs.NonRemove}:
+				case <-ctx.Done():
+					t.Fatal("watcher did not consume event:", ctx.Err())
+				}
+				select {
+				case batch := <-want:
+					if !slices.Equal(batch, []string{name}) {
+						t.Fatalf("watcher batch = %v, want [%s]", batch, name)
+					}
+				case batch := <-wrong:
+					t.Fatalf("watcher delivered to another generation's channel: %v", batch)
+				case <-ctx.Done():
+					t.Fatal("watcher did not deliver batch:", ctx.Err())
+				}
+			}
+			checkOutput(first, "first.txt", firstOutput, secondOutput)
+			checkOutput(second, "second.txt", secondOutput, firstOutput)
+		})
 	}
 }
