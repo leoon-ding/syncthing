@@ -1017,16 +1017,18 @@ func (f *folder) restartWatch(ctx context.Context) error {
 // this asynchronously, you should probably use scheduleWatchRestart instead.
 func (f *folder) startWatch(ctx context.Context) {
 	watchCtx, cancel := context.WithCancel(ctx)
+	watchChan := make(chan []string)
 	f.watchMut.Lock()
-	f.watchChan = make(chan []string)
+	f.watchChan = watchChan
 	f.watchCancel = cancel
 	f.watchMut.Unlock()
-	go f.monitorWatch(watchCtx)
+	go f.monitorWatch(watchCtx, watchChan)
 }
 
 // monitorWatch starts the filesystem watching and retries every minute on failure.
-// It should not be used except in startWatch.
-func (f *folder) monitorWatch(ctx context.Context) {
+// It should not be used except in startWatch. The output belongs to this watch
+// generation: a canceled monitor can still be returning from Watch after restart.
+func (f *folder) monitorWatch(ctx context.Context, watchChan chan<- []string) {
 	failTimer := time.NewTimer(0)
 	aggrCtx, aggrCancel := context.WithCancel(ctx)
 	var err error
@@ -1064,7 +1066,7 @@ func (f *folder) monitorWatch(ctx context.Context) {
 				continue
 			}
 			lastWatch = time.Now()
-			watchaggregator.Aggregate(aggrCtx, eventChan, f.watchChan, f.FolderConfiguration, f.model.cfg, f.evLogger)
+			watchaggregator.Aggregate(aggrCtx, eventChan, watchChan, f.FolderConfiguration, f.model.cfg, f.evLogger)
 			f.sl.DebugContext(ctx, "Started filesystem watcher")
 		case err = <-errChan:
 			var next time.Duration
