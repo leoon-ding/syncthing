@@ -7,6 +7,7 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -17,9 +18,12 @@ import (
 	"errors"
 	native "github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/relay/protocol"
+	"io"
+	"log/slog"
 	"math/big"
 	"net"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 )
@@ -35,7 +39,7 @@ func TestPrivateRegistrationCancelAndIdentityPin(t *testing.T) {
 		return tls.Certificate{Certificate: [][]byte{raw}, PrivateKey: key}
 	}
 	serverCert, clientCert := cert(), cert()
-	for _, mode := range []string{"cancel-drain", "wrong-pin", "renewal-failure", "renewal-rejected", "automatic-renewal", "cancel-renewal", "renewal-deadline"} {
+	for _, mode := range []string{"cancel-drain", "issuer-clock-ahead", "issuer-clock-ahead-renewal", "wrong-pin", "renewal-failure", "renewal-rejected", "automatic-renewal", "cancel-renewal", "renewal-deadline"} {
 		badPin := mode == "wrong-pin"
 		t.Run(mode, func(t *testing.T) {
 			listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -71,6 +75,22 @@ func TestPrivateRegistrationCancelAndIdentityPin(t *testing.T) {
 					return
 				}
 				close(ready)
+				if mode == "issuer-clock-ahead-renewal" {
+					msg, e := protocol.ReadMessage(tc)
+					if e != nil {
+						serverDone <- e
+						return
+					}
+					if _, ok := msg.(protocol.PrivateJoinRequest); !ok {
+						serverDone <- protocol.ErrPermit
+						return
+					}
+					if e := protocol.WriteMessage(tc, protocol.ResponseSuccess); e != nil {
+						serverDone <- e
+						return
+					}
+					close(renewed)
+				}
 				if mode == "automatic-renewal" {
 					for range 3 {
 						expiry, e := privatePermitExpiry(join.Permit, time.Now())
@@ -140,7 +160,11 @@ func TestPrivateRegistrationCancelAndIdentityPin(t *testing.T) {
 				if mode == "automatic-renewal" {
 					ttl = []time.Duration{2 * time.Second, 4 * time.Second, time.Second, 60 * time.Second}[calls-1]
 				}
-				return testJoinPermit(time.Now(), ttl), nil
+				issued := time.Now()
+				if strings.HasPrefix(mode, "issuer-clock-ahead") {
+					issued = issued.Add(time.Hour)
+				}
+				return testJoinPermit(issued, ttl), nil
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -160,7 +184,17 @@ func TestPrivateRegistrationCancelAndIdentityPin(t *testing.T) {
 					t.Fatal("registration not acknowledged")
 				}
 				switch mode {
-				case "cancel-drain":
+				case "cancel-drain", "issuer-clock-ahead":
+					cancel()
+				case "issuer-clock-ahead-renewal":
+					renew <- time.Now()
+					select {
+					case <-renewed:
+					case err := <-serverDone:
+						t.Fatalf("future-issued renewal failed: %v", err)
+					case <-time.After(3 * time.Second):
+						t.Fatal("future-issued renewal stalled")
+					}
 					cancel()
 				case "automatic-renewal":
 					select {
@@ -240,5 +274,81 @@ func TestPrivatePermitRenewalSchedule(t *testing.T) {
 	}
 	if _, err := permitRenewalDelay(now, now); !errors.Is(err, protocol.ErrPermit) {
 		t.Fatal("accepted expired permit")
+	}
+}
+
+func TestPrivatePermitRenewalScheduleIssuerClock(t *testing.T) {
+	now := time.Unix(1000, 250000000)
+	for _, tc := range []struct {
+		name   string
+		issued time.Time
+		ttl    time.Duration
+		want   time.Time
+	}{
+		{"issuer ahead two seconds", now.Add(2 * time.Second), 5 * time.Minute, now.Add(5 * time.Minute)},
+		{"issuer far ahead", now.Add(time.Hour), time.Minute, now.Add(time.Minute)},
+		{"short future permit", now.Add(2 * time.Second), time.Second, now.Add(time.Second)},
+		{"same clock", now, time.Minute, time.Unix(1060, 0)},
+		{"aged receipt", now.Add(-40 * time.Second), time.Minute, time.Unix(1020, 0)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			expires, err := privatePermitExpiry(testJoinPermit(tc.issued, tc.ttl), now)
+			if err != nil {
+				t.Fatalf("valid issuer-clock permit rejected before relay validation: %v", err)
+			}
+			if !expires.Equal(tc.want) {
+				t.Fatalf("expiry = %v, want %v", expires, tc.want)
+			}
+			delay, err := permitRenewalDelay(expires, now)
+			if err != nil || delay <= 0 || delay >= expires.Sub(now) || expires.Sub(now) > tc.ttl {
+				t.Fatalf("renewal must stay inside bounded lifetime: expiry=%v delay=%v err=%v", expires, delay, err)
+			}
+		})
+	}
+	for _, token := range []protocol.PermitToken{
+		testJoinPermit(now.Add(-time.Minute), time.Minute),
+		testJoinPermit(now.Add(time.Hour), 301*time.Second),
+		testJoinPermit(now.Add(time.Hour), 0),
+	} {
+		if _, err := privatePermitExpiry(token, now); !errors.Is(err, protocol.ErrPermit) {
+			t.Fatalf("accepted invalid or already expired lifetime: %v", err)
+		}
+	}
+}
+
+func TestPrivateSetupFailureDiagnostics(t *testing.T) {
+	var output bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&output, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	c := &staticClient{permit: func(context.Context) (protocol.PermitToken, error) { return "", nil }}
+	for _, tc := range []struct {
+		err    error
+		reason string
+	}{
+		{protocol.ErrPermit, "permit_invalid"},
+		{&incorrectResponseCodeErr{code: 1, msg: "SECRET_SERVER_RESPONSE"}, "relay_rejected"},
+		{context.DeadlineExceeded, "timeout"},
+		{io.EOF, "connection_closed"},
+		{errors.New("SECRET_SIGNED_PERMIT"), "transport_or_protocol"},
+	} {
+		output.Reset()
+		c.logPrivateSetupFailure(context.Background(), "join", tc.err)
+		var entry map[string]any
+		if err := json.Unmarshal(output.Bytes(), &entry); err != nil {
+			t.Fatal(err)
+		}
+		if entry["stage"] != "join" || entry["reason"] != tc.reason || strings.Contains(output.String(), "SECRET") {
+			t.Fatalf("missing classification or leaked error content: %s", output.String())
+		}
+	}
+	output.Reset()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	c.logPrivateSetupFailure(ctx, "connect", context.Canceled)
+	c.permit = nil
+	c.logPrivateSetupFailure(context.Background(), "connect", errors.New("legacy failure"))
+	if output.Len() != 0 {
+		t.Fatalf("normal cancellation or legacy client emitted private failure: %s", output.String())
 	}
 }
