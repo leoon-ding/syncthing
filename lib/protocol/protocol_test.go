@@ -15,6 +15,7 @@ import (
 	"io"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	lz4 "github.com/pierrec/lz4/v4"
@@ -702,7 +703,7 @@ func TestFolderIndexBorrowEndsAfterActualWrite(t *testing.T) {
 	exited := make(chan struct{})
 	go func() { defer close(exited); c.writerLoop() }()
 	ccDone := make(chan struct{})
-	c.clusterConfigBox <- clusterConfigMessage{config: &ClusterConfig{}, done: ccDone}
+	c.clusterConfigBox <- clusterConfigMessage{config: &ClusterConfig{Folders: []Folder{{ID: "one"}}}, done: ccDone}
 	<-ccDone
 	// No write is active between the initial config and Index submission.
 	writer := heldFolderWriter{make(chan struct{}, 1), make(chan struct{})}
@@ -745,7 +746,7 @@ func TestFolderIndexCancellationDoesNotWaitForOtherFolderWrite(t *testing.T) {
 				exited := make(chan struct{})
 				go func() { defer close(exited); c.writerLoop() }()
 				ccDone := make(chan struct{})
-				c.clusterConfigBox <- clusterConfigMessage{config: &ClusterConfig{}, done: ccDone}
+				c.clusterConfigBox <- clusterConfigMessage{config: &ClusterConfig{Folders: []Folder{{ID: "A"}, {ID: "B"}, {ID: "C"}}}, done: ccDone}
 				<-ccDone
 				writer := heldFolderWriter{make(chan struct{}, 1), make(chan struct{})}
 				c.cw = &countingWriter{Writer: writer}
@@ -1262,6 +1263,7 @@ func TestFolderIndexWriteOutcome(t *testing.T) {
 				c.folderAdmit = func(context.Context, string) (context.Context, func(), error) {
 					return scope, func() { close(released) }, nil
 				}
+				c.recordWrittenAnnouncement(&ClusterConfig{Folders: []Folder{{ID: "folder"}}})
 				result := make(chan error, 1)
 				indexDone := make(chan struct{})
 				go func() {
@@ -1281,7 +1283,7 @@ func TestFolderIndexWriteOutcome(t *testing.T) {
 				exited := make(chan struct{})
 				go func() { defer close(exited); c.writerLoop() }()
 				ccDone := make(chan struct{})
-				c.clusterConfigBox <- clusterConfigMessage{config: &ClusterConfig{}, done: ccDone}
+				c.clusterConfigBox <- clusterConfigMessage{config: &ClusterConfig{Folders: []Folder{{ID: "folder"}}}, done: ccDone}
 				<-ccDone
 				writer := &indexOutcomeWriter{entered: make(chan struct{}), resume: make(chan struct{}), fail: mode == "failed"}
 				c.cw = &countingWriter{Writer: writer}
@@ -1339,4 +1341,179 @@ func (w *indexOutcomeWriter) Write(p []byte) (int, error) {
 		return 0, io.ErrClosedPipe
 	}
 	return len(p), nil
+}
+
+// A reopened data fence is not evidence that the peer has received our new
+// folder announcement. Exercise the real writer's ordering on an existing BEP.
+func TestFolderIndexWaitsForWrittenAnnouncement(t *testing.T) {
+	for _, update := range []bool{false, true} {
+		t.Run(fmt.Sprint(update), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var output bytes.Buffer
+				c := newRawConnection(c0ID, bytes.NewReader(nil), &output, testutil.NoopCloser{}, nil, new(mockedConnectionInfo), CompressionNever)
+				c.folderAdmit = func(ctx context.Context, _ string) (context.Context, func(), error) { return ctx, func() {}, nil }
+				exited := make(chan struct{})
+				go func() { defer close(exited); c.writerLoop() }()
+				defer func() { close(c.closed); <-exited }()
+				c.ClusterConfig(&ClusterConfig{Folders: []Folder{{ID: "existing"}}}, nil)
+				done := make(chan error, 1)
+				go func() {
+					if update {
+						done <- c.IndexUpdate(context.Background(), &IndexUpdate{Folder: "reverse"})
+					} else {
+						done <- c.Index(context.Background(), &Index{Folder: "reverse"})
+					}
+				}()
+				synctest.Wait()
+				select {
+				case err := <-done:
+					t.Fatalf("index passed its withheld announcement: %v", err)
+				default:
+				}
+				if err := c.Index(context.Background(), &Index{Folder: "existing"}); err != nil {
+					t.Fatal(err)
+				}
+				c.ClusterConfig(&ClusterConfig{Folders: []Folder{{ID: "existing"}, {ID: "reverse"}}}, nil)
+				if err := <-done; err != nil {
+					t.Fatal(err)
+				}
+				reader := newRawConnection(c1ID, bytes.NewReader(output.Bytes()), io.Discard, testutil.NoopCloser{}, nil, new(mockedConnectionInfo), CompressionNever)
+				for i := 0; i < 4; i++ {
+					msg, err := reader.readMessage(make([]byte, 4))
+					if err != nil {
+						t.Fatal(err)
+					}
+					if i == 2 {
+						if cc, ok := msg.(*bep.ClusterConfig); !ok || len(cc.Folders) != 2 {
+							t.Fatalf("announcement must precede new index: %T", msg)
+						}
+					}
+					if i == 3 {
+						switch m := msg.(type) {
+						case *bep.Index:
+							if m.Folder != "reverse" {
+								t.Fatal(m)
+							}
+						case *bep.IndexUpdate:
+							if m.Folder != "reverse" {
+								t.Fatal(m)
+							}
+						default:
+							t.Fatalf("last message: %T", msg)
+						}
+					}
+				}
+			})
+		})
+	}
+}
+
+func TestFolderIndexAnnouncementWaitCancellationAndWithdrawal(t *testing.T) {
+	for _, mode := range []string{"cancel", "close", "withdraw", "pause", "canceled-announcement", "failed-announcement"} {
+		t.Run(mode, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				c := newRawConnection(c0ID, bytes.NewReader(nil), io.Discard, testutil.NoopCloser{}, nil, new(mockedConnectionInfo), CompressionNever)
+				c.folderAdmit = func(ctx context.Context, _ string) (context.Context, func(), error) { return ctx, func() {}, nil }
+				exited := make(chan struct{})
+				go func() { defer close(exited); c.writerLoop() }()
+				var once sync.Once
+				shutdown := func() { once.Do(func() { close(c.closed) }) }
+				defer func() { shutdown(); <-exited }()
+				cc := &ClusterConfig{Folders: []Folder{{ID: "existing"}, {ID: "reverse"}}}
+				if mode == "withdraw" || mode == "pause" {
+					c.ClusterConfig(cc, nil)
+					c.idxGate <- struct{}{} // Let the sender observe readiness, but delay its handoff.
+				} else {
+					c.ClusterConfig(&ClusterConfig{Folders: []Folder{{ID: "existing"}}}, nil)
+				}
+				ctx, cancel := context.WithCancelCause(context.Background())
+				defer cancel(nil)
+				done := make(chan error, 1)
+				go func() { done <- c.Index(ctx, &Index{Folder: "reverse"}) }()
+				synctest.Wait()
+				if mode == "withdraw" || mode == "pause" {
+					next := &ClusterConfig{Folders: []Folder{{ID: "existing"}}}
+					if mode == "pause" {
+						next.Folders = append(next.Folders, Folder{ID: "reverse", StopReason: FolderStopReasonPaused})
+					}
+					c.ClusterConfig(next, nil)
+					<-c.idxGate
+				}
+				if mode == "canceled-announcement" || mode == "failed-announcement" {
+					scoped, abort := context.WithCancel(context.Background())
+					abort()
+					message := clusterConfigMessage{config: cc, scopes: []context.Context{scoped}, done: make(chan struct{})}
+					if mode == "failed-announcement" {
+						message.scopes = nil
+						c.cw = &countingWriter{Writer: announcementErrorWriter{}}
+					}
+					// No writer operation is active: test the exact completion helper.
+					_, err := c.writeClusterConfig(message)
+					if mode == "failed-announcement" {
+						if !errors.Is(err, io.ErrClosedPipe) {
+							t.Fatal(err)
+						}
+						c.cw = &countingWriter{Writer: io.Discard}
+					}
+				}
+				synctest.Wait()
+				select {
+				case err := <-done:
+					t.Fatalf("index passed missing/withdrawn announcement: %v", err)
+				default:
+				}
+				if err := c.Index(context.Background(), &Index{Folder: "existing"}); err != nil {
+					t.Fatal(err)
+				}
+				if mode == "close" {
+					shutdown()
+					if err := <-done; !errors.Is(err, ErrClosed) {
+						t.Fatal(err)
+					}
+				} else if mode == "cancel" {
+					cancel(ErrFolderAccessClosed)
+					if err := <-done; !errors.Is(err, ErrFolderAccessClosed) {
+						t.Fatal(err)
+					}
+				} else {
+					c.ClusterConfig(cc, nil)
+					if err := <-done; err != nil {
+						t.Fatal(err)
+					}
+				}
+			})
+		})
+	}
+}
+
+type announcementErrorWriter struct{}
+
+func (announcementErrorWriter) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }
+
+func TestFolderIndexSecondaryPromotionRestoresAnnouncementGate(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := newRawConnection(c0ID, bytes.NewReader(nil), io.Discard, testutil.NoopCloser{}, nil, new(mockedConnectionInfo), CompressionNever)
+		c.folderAdmit = func(ctx context.Context, _ string) (context.Context, func(), error) { return ctx, func() {}, nil }
+		exited := make(chan struct{})
+		go func() { defer close(exited); c.writerLoop() }()
+		defer func() { close(c.closed); <-exited }()
+		c.ClusterConfig(&ClusterConfig{Secondary: true}, nil)
+		if err := c.Index(context.Background(), &Index{Folder: "reverse"}); err != nil {
+			t.Fatal(err)
+		}
+		// Promotion makes this connection responsible for the complete metadata.
+		c.ClusterConfig(&ClusterConfig{Folders: []Folder{{ID: "existing"}}}, nil)
+		done := make(chan error, 1)
+		go func() { done <- c.Index(context.Background(), &Index{Folder: "reverse"}) }()
+		synctest.Wait()
+		select {
+		case err := <-done:
+			t.Fatalf("secondary readiness survived promotion: %v", err)
+		default:
+		}
+		c.ClusterConfig(&ClusterConfig{Folders: []Folder{{ID: "existing"}, {ID: "reverse"}}}, nil)
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	})
 }

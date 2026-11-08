@@ -177,6 +177,13 @@ type rawConnection struct {
 
 	idxGate chan struct{} // serializes Index calls with cancelable admission
 
+	// Only successfully written primary announcements make a folder ready for
+	// indexes. Admission reopening alone cannot establish this wire ordering.
+	announcementMut       sync.Mutex
+	announcedFolders      map[string]struct{}
+	secondaryAnnouncement bool
+	announcementChanged   chan struct{}
+
 	inbox                 chan proto.Message
 	outbox                chan asyncMessage
 	closeBox              chan asyncMessage
@@ -275,6 +282,7 @@ func newRawConnection(deviceID DeviceID, reader io.Reader, writer io.Writer, clo
 		closeBox:              make(chan asyncMessage),
 		clusterConfigBox:      make(chan clusterConfigMessage),
 		idxGate:               make(chan struct{}, 1),
+		announcementChanged:   make(chan struct{}),
 		dispatcherLoopStopped: make(chan struct{}),
 		closed:                make(chan struct{}),
 		compression:           compress,
@@ -373,7 +381,7 @@ func (c *rawConnection) Index(ctx context.Context, idx *Index) error {
 			return err
 		}
 		defer release()
-		return c.sendAdmittedIndex(scope, idx.toWire())
+		return c.sendAdmittedIndex(scope, idx.Folder, idx.toWire())
 	}
 	if err := c.lockIndex(ctx); err != nil {
 		return err
@@ -398,7 +406,7 @@ func (c *rawConnection) IndexUpdate(ctx context.Context, idxUp *IndexUpdate) err
 			return err
 		}
 		defer release()
-		return c.sendAdmittedIndex(scope, idxUp.toWire())
+		return c.sendAdmittedIndex(scope, idxUp.Folder, idxUp.toWire())
 	}
 	if err := c.lockIndex(ctx); err != nil {
 		return err
@@ -408,28 +416,109 @@ func (c *rawConnection) IndexUpdate(ctx context.Context, idxUp *IndexUpdate) err
 	return nil
 }
 
+var errIndexAnnouncementPending = errors.New("index awaits folder announcement")
+
 // sendAdmittedIndex retains the borrow until the writer actually finishes.
 // A canceled queued message is retryable; a fully written message stays successful
 // even if admission was revoked during the write. This is not a remote ACK.
-func (c *rawConnection) sendAdmittedIndex(scope context.Context, msg proto.Message) error {
-	if err := c.lockIndex(scope); err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return context.Cause(scope)
+func (c *rawConnection) sendAdmittedIndex(scope context.Context, folder string, msg proto.Message) error {
+	for {
+		if err := c.waitFolderAnnouncement(scope, folder); err != nil {
+			return err
 		}
-		return err
+		if err := c.lockIndex(scope); err != nil {
+			if scope.Err() != nil {
+				return context.Cause(scope)
+			}
+			return err
+		}
+		written := make(chan error, 1)
+		var err error
+		select {
+		case c.outbox <- asyncMessage{ctx: scope, msg: msg, written: written}:
+			// The writer owns completion after the unbuffered handoff, including
+			// cancellation and a withdrawal which overtook this queued index.
+			err = <-written
+		case <-c.closed:
+			err = ErrClosed
+		case <-scope.Done():
+			err = context.Cause(scope)
+		}
+		<-c.idxGate
+		if !errors.Is(err, errIndexAnnouncementPending) {
+			return err
+		}
 	}
-	defer func() { <-c.idxGate }()
-	written := make(chan error, 1)
-	select {
-	case c.outbox <- asyncMessage{ctx: scope, msg: msg, written: written}:
-		// outbox is unbuffered: the writer now owns this message and will
-		// complete it even when the scope or connection is canceled.
-		return <-written
-	case <-c.closed:
-		return ErrClosed
-	case <-scope.Done():
-		return context.Cause(scope)
+}
+
+func (c *rawConnection) waitFolderAnnouncement(ctx context.Context, folder string) error {
+	for {
+		if ctx.Err() != nil {
+			return context.Cause(ctx)
+		}
+		select {
+		case <-c.closed:
+			return ErrClosed
+		default:
+		}
+		c.announcementMut.Lock()
+		_, ready := c.announcedFolders[folder]
+		ready = ready || c.secondaryAnnouncement
+		changed := c.announcementChanged
+		c.announcementMut.Unlock()
+		if ready {
+			return nil
+		}
+		// No connection-wide index slot is held while a new folder waits, so
+		// existing folders and control traffic can continue on this BEP.
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		case <-c.closed:
+			return ErrClosed
+		}
 	}
+}
+
+// Called only by the writer. The latest complete primary snapshot also
+// withdraws paused/removed folders. Secondary changes the connection role;
+// it never claims that any folder has been announced on this connection.
+func (c *rawConnection) recordWrittenAnnouncement(config *ClusterConfig) {
+	folders := make(map[string]struct{}, len(config.Folders))
+	if !config.Secondary {
+		for _, f := range config.Folders {
+			if f.IsRunning() {
+				folders[f.ID] = struct{}{}
+			}
+		}
+	}
+	c.announcementMut.Lock()
+	c.announcedFolders = folders
+	// Both ends independently choose their index-receiving primary. On a
+	// locally secondary connection, the receiving model coordinates indexes
+	// with the full announcement arriving on its other connection.
+	c.secondaryAnnouncement = config.Secondary
+	close(c.announcementChanged)
+	c.announcementChanged = make(chan struct{})
+	c.announcementMut.Unlock()
+}
+
+func (c *rawConnection) indexAnnouncementReady(msg proto.Message) bool {
+	var folder string
+	switch m := msg.(type) {
+	case *bep.Index:
+		folder = m.Folder
+	case *bep.IndexUpdate:
+		folder = m.Folder
+	default:
+		return true
+	}
+	c.announcementMut.Lock()
+	_, ready := c.announcedFolders[folder]
+	ready = ready || c.secondaryAnnouncement
+	c.announcementMut.Unlock()
+	return ready
 }
 
 // Request returns the bytes for the specified block after fetching them from the connected peer.
@@ -558,7 +647,11 @@ func (c *rawConnection) writeClusterConfig(message clusterConfigMessage) (bool, 
 			return false, nil
 		}
 	}
-	return true, c.writeMessage(message.config.toWire())
+	err := c.writeMessage(message.config.toWire())
+	if err == nil {
+		c.recordWrittenAnnouncement(message.config)
+	}
+	return true, err
 }
 
 func (c *rawConnection) Closed() <-chan struct{} {
@@ -955,6 +1048,12 @@ initial:
 					}
 					continue
 				}
+			}
+			// Recheck in wire order: a pause/withdrawal may have been written
+			// after the sender observed readiness but before this handoff.
+			if hm.written != nil && c.folderAdmit != nil && !c.indexAnnouncementReady(hm.msg) {
+				hm.written <- errIndexAnnouncementPending
+				continue
 			}
 			err := c.writeMessage(hm.msg)
 			if hm.written != nil {

@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/syncthing/syncthing/internal/db"
+	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/protocol"
 	pm "github.com/syncthing/syncthing/lib/protocol/mocks"
@@ -610,7 +611,7 @@ func TestFolderAccessIndexRecoveryOnExistingBEP(t *testing.T) {
 			<-conn.Closed()
 			<-remote.Closed()
 		}()
-		conn.ClusterConfig(&protocol.ClusterConfig{}, nil)
+		conn.ClusterConfig(&protocol.ClusterConfig{Folders: []protocol.Folder{{ID: "sibling"}}}, nil)
 		remote.ClusterConfig(&protocol.ClusterConfig{}, nil)
 		store := &admissionIndexDB{id: 17, sequence: 2}
 		sender, err := newIndexHandler(conn, nil, newFolderConfig(), store, new(admissionIndexRunner), &clusterConfigDeviceInfo{remote: protocol.Device{IndexID: 17}}, events.NoopLogger)
@@ -640,6 +641,7 @@ func TestFolderAccessIndexRecoveryOnExistingBEP(t *testing.T) {
 		if err := g.Open(device1, "default"); err != nil {
 			t.Fatal(err)
 		}
+		conn.ClusterConfig(&protocol.ClusterConfig{Folders: []protocol.Folder{{ID: "sibling"}, {ID: "default"}}}, nil)
 		if err := <-done; err != nil {
 			t.Fatal(err)
 		}
@@ -678,3 +680,209 @@ func (*admissionIndexReceiver) ClusterConfig(protocol.Connection, *protocol.Clus
 	return nil
 }
 func (*admissionIndexReceiver) Closed(protocol.Connection, error) {}
+
+// Two real models negotiate a hot-added folder over one real BEP pair. Hold
+// the sender's fresh advertisement while reopening admission, so the resumed
+// sender deterministically races ahead of that advertisement.
+func TestFolderAccessHotAddTwoModelsAnnouncementOrdering(t *testing.T) {
+	for _, asymmetric := range []bool{false, true} {
+		t.Run(fmt.Sprint(asymmetric), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				makeModel := func(id, peer protocol.DeviceID) (*testModel, *FolderAccess) {
+					raw := config.New(id)
+					raw.SetDevice(config.DeviceConfiguration{DeviceID: peer})
+					folder := newFolderConfig()
+					folder.CaseSensitiveFS = true
+					folder.Devices = []config.FolderDeviceConfiguration{{DeviceID: id}, {DeviceID: peer}}
+					raw.SetFolder(folder)
+					cfg := config.Wrap("", raw, id, events.NoopLogger)
+					ctx, cancel := context.WithCancel(t.Context())
+					go cfg.Serve(ctx)
+					t.Cleanup(cancel)
+					g := new(FolderAccess)
+					m := newModel(t, cfg, id, nil)
+					m.folderAccess = g
+					m.ServeBackground()
+					m.ScanFolders()
+					return m, g
+				}
+				a, ag := makeModel(myID, device1)
+				defer cleanupModel(a)
+				b, bg := makeModel(device1, myID)
+				defer cleanupModel(b)
+				var pipes []io.Closer
+				var acs, bcs []protocol.Connection
+				count := 1
+				if asymmetric {
+					count = 2
+				}
+				for i := 0; i < count; i++ {
+					ar, aw := io.Pipe()
+					br, bw := io.Pipe()
+					pipes = append(pipes, ar, aw, br, bw)
+					ai, bi := new(pm.ConnectionInfo), new(pm.ConnectionInfo)
+					ai.ConnectionIDReturns(fmt.Sprint("a-", i))
+					bi.ConnectionIDReturns(fmt.Sprint("b-", i))
+					acs = append(acs, protocol.NewConnectionWithAnnouncement(device1, ar, bw, testutil.NoopCloser{}, a, ai, protocol.CompressionNever, protocol.NewKeyGenerator(), func(ctx context.Context, f string, p bool) (context.Context, func(), error) {
+						return ag.AdmitAnnouncement(ctx, device1, f, p)
+					}, func(ctx context.Context, f string) (context.Context, func(), error) { return ag.Admit(ctx, device1, f) }))
+					bcs = append(bcs, protocol.NewConnectionWithAnnouncement(myID, br, aw, testutil.NoopCloser{}, b, bi, protocol.CompressionNever, protocol.NewKeyGenerator(), func(ctx context.Context, f string, p bool) (context.Context, func(), error) {
+						return bg.AdmitAnnouncement(ctx, myID, f, p)
+					}, func(ctx context.Context, f string) (context.Context, func(), error) { return bg.Admit(ctx, myID, f) }))
+				}
+				// Opposite local primaries in the two-connection case. Start readers
+				// before io.Pipe writes (unlike a socket, pipes have no send buffer).
+				held := &heldFolderAnnouncement{Connection: bcs[count-1], resume: make(chan struct{})}
+				for i := range acs {
+					acs[i].Start()
+					bcs[i].Start()
+					a.AddConnection(acs[i], protocol.Hello{})
+				}
+				b.AddConnection(held, protocol.Hello{})
+				if asymmetric {
+					b.AddConnection(bcs[0], protocol.Hello{})
+				}
+				var closed []<-chan struct{}
+				for i := range acs {
+					a.mut.RLock()
+					closed = append(closed, a.closed[acs[i].ConnectionID()])
+					a.mut.RUnlock()
+					b.mut.RLock()
+					closed = append(closed, b.closed[bcs[i].ConnectionID()])
+					b.mut.RUnlock()
+				}
+				defer func() {
+					held.release()
+					for _, p := range pipes {
+						p.Close()
+					}
+					for i := range acs {
+						acs[i].Close(io.EOF)
+						bcs[i].Close(io.EOF)
+					}
+					for _, done := range closed {
+						<-done
+					}
+				}()
+				if asymmetric {
+					acs[1].ClusterConfig(&protocol.ClusterConfig{Secondary: true}, nil)
+					bcs[0].ClusterConfig(&protocol.ClusterConfig{Secondary: true}, nil)
+				}
+				a.promoteConnections()
+				b.promoteConnections()
+				synctest.Wait()
+				assertConnected := func() {
+					t.Helper()
+					for i := range acs {
+						select {
+						case <-acs[i].Closed():
+							t.Fatal("A BEP closed", i)
+						default:
+						}
+						select {
+						case <-bcs[i].Closed():
+							t.Fatal("B BEP closed", i)
+						default:
+						}
+					}
+				}
+				assertConnected()
+				ag.Seal(device1, "reverse")
+				bg.Seal(myID, "reverse")
+				install := func(m *testModel) {
+					f := newFolderConfig()
+					f.CaseSensitiveFS = true
+					f.ID = "reverse"
+					f.Devices = []config.FolderDeviceConfiguration{{DeviceID: myID}, {DeviceID: device1}}
+					w, err := m.cfg.Modify(func(c *config.Configuration) { c.SetFolder(f) })
+					must(t, err)
+					w.Wait()
+					must(t, m.ScanFolder("reverse"))
+				}
+				install(a)
+				install(b)
+				synctest.Wait()
+				// No reverse advertisement has passed either fence. A opens first and
+				// announces to B while B still defers incoming negotiation.
+				must(t, ag.Open(device1, "reverse"))
+				synctest.Wait()
+				b.mut.RLock()
+				registry, ok := b.indexHandlers.Get(myID)
+				b.mut.RUnlock()
+				if !ok || registry.pendingClusterConfig == nil {
+					t.Fatal("B did not defer A's folder announcement")
+				}
+				// Seed a valid initial index before B's real sender is created/resumed.
+				must(t, b.sdb.Update("reverse", protocol.LocalDeviceID, []protocol.FileInfo{{Name: "first", Deleted: true, Version: protocol.Vector{}.Update(device1.Short())}}))
+				held.mu.Lock()
+				held.hold = true
+				held.mu.Unlock()
+				must(t, bg.Open(myID, "reverse"))
+				synctest.Wait()
+				assertConnected()
+				seq, err := a.sdb.GetDeviceSequence("reverse", device1)
+				must(t, err)
+				if seq != 0 {
+					t.Fatal("index preceded B's withheld announcement", seq)
+				}
+				// Existing traffic must continue while reverse waits for its announcement.
+				must(t, acs[count-1].IndexUpdate(context.Background(), &protocol.IndexUpdate{Folder: "default", Files: []protocol.FileInfo{{Name: "sibling", Deleted: true, Sequence: 1, Version: protocol.Vector{}.Update(myID.Short())}}, LastSequence: 1}))
+				synctest.Wait()
+				seq, err = b.sdb.GetDeviceSequence("default", myID)
+				must(t, err)
+				if seq != 1 {
+					t.Fatal("sibling was blocked", seq)
+				}
+				held.mu.Lock()
+				held.hold = false
+				held.mu.Unlock()
+				held.release()
+				synctest.Wait()
+				assertConnected()
+				seq, err = a.sdb.GetDeviceSequence("reverse", device1)
+				must(t, err)
+				if seq != 1 {
+					t.Fatal("first index not received without reconnect", seq)
+				}
+				// Drive a second real sender cycle after updating the local database.
+				must(t, b.sdb.Update("reverse", protocol.LocalDeviceID, []protocol.FileInfo{{Name: "second", Deleted: true, Version: protocol.Vector{}.Update(device1.Short())}}))
+				b.evLogger.Log(events.LocalIndexUpdated, map[string]interface{}{"folder": "reverse"})
+				synctest.Wait()
+				assertConnected()
+				seq, err = a.sdb.GetDeviceSequence("reverse", device1)
+				must(t, err)
+				if seq != 2 {
+					t.Fatal("incremental index not received", seq)
+				}
+			})
+		})
+	}
+}
+
+type heldFolderAnnouncement struct {
+	protocol.Connection
+	mu     sync.Mutex
+	hold   bool
+	resume chan struct{}
+	once   sync.Once
+}
+
+func (c *heldFolderAnnouncement) release() { c.once.Do(func() { close(c.resume) }) }
+func (c *heldFolderAnnouncement) ClusterConfig(cc *protocol.ClusterConfig, passwords map[string]string) {
+	c.mu.Lock()
+	hold := c.hold
+	c.mu.Unlock()
+	if hold {
+		for _, f := range cc.Folders {
+			if f.ID == "reverse" {
+				select {
+				case <-c.resume:
+				case <-c.Closed():
+					return
+				}
+				break
+			}
+		}
+	}
+	c.Connection.ClusterConfig(cc, passwords)
+}

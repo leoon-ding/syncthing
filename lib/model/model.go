@@ -148,7 +148,7 @@ type model struct {
 	progressEmitter *ProgressEmitter
 	// Serialize index negotiation and replay with registry replacement/close.
 	// Acquire before mut; never wait on this mutex while holding mut.
-	deviceIndexLocks sync.Map // device ID -> single index-lifecycle permit
+	deviceIndexLocks sync.Map // device ID -> *deviceIndexState
 	shortID          protocol.ShortID
 	// globalRequestLimiter limits the amount of data in concurrent incoming
 	// requests
@@ -1178,58 +1178,122 @@ func (m *model) IndexUpdate(conn protocol.Connection, idxUp *protocol.IndexUpdat
 }
 
 func (m *model) handleIndex(conn protocol.Connection, folder string, fs []protocol.FileInfo, update bool, prevSequence, lastSequence int64) error {
-	releaseLifecycle := m.lockDeviceIndex(conn.DeviceID())
-	defer releaseLifecycle()
-	// Reopening also wakes the model loop, but a peer's first Index can arrive
-	// before that loop runs. Apply deferred negotiation before consuming data.
-	m.mut.RLock()
-	registry, registered := m.getIndexHandlerRLocked(conn)
-	m.mut.RUnlock()
-	if registered {
-		if err := m.retryPendingClusterConfig(registry); err != nil {
-			return err
-		}
-	}
 	scope, release, err := m.folderAccess.Admit(context.Background(), conn.DeviceID(), folder)
 	if err != nil {
 		return nil
 	}
 	defer release()
+	// Retain this admission generation across the wait, but never hold the
+	// device lifecycle permit while another connection must apply its config.
+	waiting := false
+	var revision uint64
+	var deadline time.Time
+	for {
+		releaseLifecycle := m.lockDeviceIndex(conn.DeviceID())
+		state := m.deviceIndexState(conn.DeviceID())
+		err, changed, otherClosed := m.handleIndexLocked(conn, folder, fs, update, prevSequence, lastSequence, scope, !waiting || state.revision == revision)
+		revision = state.revision
+		releaseLifecycle()
+		if changed == nil {
+			return err
+		}
+		cases := []reflect.SelectCase{
+			{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(changed)},
+			{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(scope.Done())},
+			{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(conn.Closed())},
+		}
+		for _, closed := range otherClosed {
+			cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(closed)})
+		}
+		// Bound malformed/incomplete negotiation by the existing BEP receive
+		// timeout, even if the other connection keeps sending unrelated traffic.
+		if !waiting {
+			deadline = time.Now().Add(protocol.ReceiveTimeout)
+			waiting = true
+		}
+		timer := time.NewTimer(time.Until(deadline))
+		cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(timer.C)})
+		selected, _, _ := reflect.Select(cases)
+		timer.Stop()
+		switch {
+		case selected == 0:
+			// Recheck roles; only a complete applied snapshot ends negotiation.
+		case selected == 1:
+			return nil // revoked work must not survive a later reopen
+		case selected == len(cases)-1:
+			return fmt.Errorf("waiting for folder %s announcement: %w", folder, context.DeadlineExceeded)
+		default:
+			return protocol.ErrClosed
+		}
+	}
+}
+
+// Requires the device index-lifecycle permit. A nil notification means final.
+func (m *model) handleIndexLocked(conn protocol.Connection, folder string, fs []protocol.FileInfo, update bool, prevSequence, lastSequence int64, scope context.Context, allowWait bool) (error, <-chan struct{}, []<-chan struct{}) {
+	select {
+	case <-conn.Closed():
+		return protocol.ErrClosed, nil, nil
+	default:
+	}
 	if scope.Err() != nil {
-		return nil
+		return nil, nil, nil
+	}
+	m.mut.RLock()
+	registry, registered := m.getIndexHandlerRLocked(conn)
+	m.mut.RUnlock()
+	if registered {
+		if err := m.retryPendingClusterConfig(registry); err != nil {
+			return err, nil, nil
+		}
+	}
+	if scope.Err() != nil {
+		return nil, nil, nil
 	}
 	op := "Index"
 	if update {
 		op += " update"
 	}
-
 	deviceID := conn.DeviceID()
 	l.Debugf("%v (in): %s / %q: %d files", op, deviceID, folder, len(fs))
-
 	if cfg, ok := m.cfg.Folder(folder); !ok || !cfg.SharedWith(deviceID) {
-		slog.Warn(`Operation for unexpected folder ID; ensure that the folder exists and that this device is selected under "Share With" in the folder configuration.`, slog.String("operation", op), cfg.LogAttr(), deviceID.LogAttr())
-		return fmt.Errorf("%s: %w", folder, ErrFolderMissing)
+		slog.Warn("Operation for unexpected folder ID", slog.String("operation", op), cfg.LogAttr(), deviceID.LogAttr())
+		return fmt.Errorf("%s: %w", folder, ErrFolderMissing), nil, nil
 	} else if cfg.Paused {
-		l.Debugf("%v for paused folder (ID %q) sent from device %q.", op, folder, deviceID)
-		return fmt.Errorf("%s: %w", folder, ErrFolderPaused)
+		return fmt.Errorf("%s: %w", folder, ErrFolderPaused), nil, nil
 	}
-
 	m.mut.RLock()
-	indexHandler, ok := m.getIndexHandlerRLocked(conn)
+	registry, registered = m.getIndexHandlerRLocked(conn)
+	state := m.deviceIndexState(deviceID)
+	// Secondary received on our live primary is evidence that the peer's
+	// complete config must be processed by a different dispatcher. Without
+	// this evidence waiting could deadlock on this very connection's next CC.
+	var others []<-chan struct{}
+	ids := m.deviceConnIDs[deviceID]
+	if allowWait && m.folderAccess != nil && state.secondary[conn.ConnectionID()] && len(ids) > 1 && ids[0] == conn.ConnectionID() {
+		for _, id := range ids[1:] {
+			if other, ok := m.connections[id]; ok && !state.secondary[id] {
+				others = append(others, other.Closed())
+			}
+		}
+	}
 	m.mut.RUnlock()
-	if !ok {
-		// This should be impossible, as an index handler is registered when
-		// we send a cluster config, and that is what triggers index
-		// sending.
+	hasHandler := false
+	if registered {
+		registry.mut.Lock()
+		_, hasHandler = registry.indexHandlers.Get(folder)
+		registry.mut.Unlock()
+	}
+	if !hasHandler && len(others) > 0 {
+		return nil, state.changed, others
+	}
+	if !registered {
 		m.evLogger.Log(events.Failure, "index sender does not exist for connection on which indexes were received")
-		l.Debugf("%v for folder (ID %q) sent from device %q: missing index handler", op, folder, deviceID)
-		return fmt.Errorf("%s: %w", folder, ErrFolderNotRunning)
+		return fmt.Errorf("%s: %w", folder, ErrFolderNotRunning), nil, nil
 	}
-
 	if scope.Err() != nil {
-		return nil
+		return nil, nil, nil
 	}
-	return indexHandler.ReceiveIndex(folder, fs, update, op, prevSequence, lastSequence, scope)
+	return registry.ReceiveIndex(folder, fs, update, op, prevSequence, lastSequence, scope), nil, nil
 }
 
 type clusterConfigDeviceInfo struct {
@@ -1240,23 +1304,53 @@ type ClusterConfigReceivedEventData struct {
 	Device protocol.DeviceID `json:"device"`
 }
 
-// lockDeviceIndex serializes index negotiation, replay, and connection teardown
-// for one device. Never acquire the permit while holding m.mut. The channel
-// represents the admitted operation's completion, including during shutdown.
+// deviceIndexState owns one peer's serialized negotiation and completion signal.
+type deviceIndexState struct {
+	permit chan struct{}
+	// Protected by permit, including role evidence for each registered BEP.
+	changed   chan struct{}
+	revision  uint64 // complete remote snapshots; Secondary is not a withdrawal
+	secondary map[string]bool
+}
+
+func (m *model) deviceIndexState(device protocol.DeviceID) *deviceIndexState {
+	if value, ok := m.deviceIndexLocks.Load(device); ok {
+		return value.(*deviceIndexState)
+	}
+	value, _ := m.deviceIndexLocks.LoadOrStore(device, &deviceIndexState{permit: make(chan struct{}, 1), changed: make(chan struct{}), secondary: make(map[string]bool)})
+	return value.(*deviceIndexState)
+}
+
+// lockDeviceIndex must be acquired before m.mut. Waiters release it before
+// awaiting negotiation on another connection, permitting cancellation/teardown.
 func (m *model) lockDeviceIndex(device protocol.DeviceID) func() {
-	value, _ := m.deviceIndexLocks.LoadOrStore(device, make(chan struct{}, 1))
-	permit := value.(chan struct{})
-	permit <- struct{}{}
-	return func() { <-permit }
+	state := m.deviceIndexState(device)
+	state.permit <- struct{}{}
+	return func() { <-state.permit }
+}
+
+func (m *model) notifyDeviceIndex(device protocol.DeviceID) {
+	state := m.deviceIndexState(device)
+	close(state.changed)
+	state.changed = make(chan struct{})
 }
 
 func (m *model) ClusterConfig(conn protocol.Connection, cm *protocol.ClusterConfig) error {
-	if cm.Secondary {
-		// Secondary announcements only mark the connection ready.
-		return nil
-	}
 	releaseLifecycle := m.lockDeviceIndex(conn.DeviceID())
 	defer releaseLifecycle()
+	state := m.deviceIndexState(conn.DeviceID())
+	if cm.Secondary {
+		m.mut.RLock()
+		_, connected := m.connections[conn.ConnectionID()]
+		m.mut.RUnlock()
+		if !connected {
+			return protocol.ErrClosed
+		}
+		state.secondary[conn.ConnectionID()] = true
+		m.notifyDeviceIndex(conn.DeviceID())
+		return nil
+	}
+	state.secondary[conn.ConnectionID()] = false
 	registry := m.ensureIndexHandler(conn)
 	return m.applyClusterConfig(conn, cm, registry, nil)
 }
@@ -1296,6 +1390,15 @@ func (m *model) retryPendingClusterConfigs() {
 }
 
 func (m *model) applyClusterConfig(conn protocol.Connection, cm *protocol.ClusterConfig, indexHandlerRegistry *indexHandlerRegistry, retry map[string]struct{}) error {
+	defer func() {
+		// Replaying locally deferred folders is not a new remote snapshot.
+		// Wake waiters to recheck handlers without treating missing folders
+		// in that old snapshot as a fresh withdrawal.
+		if retry == nil {
+			m.deviceIndexState(conn.DeviceID()).revision++
+		}
+		m.notifyDeviceIndex(conn.DeviceID())
+	}()
 	deviceID := conn.DeviceID()
 	original := cm
 	scopes := make(map[string]context.Context)
@@ -2073,6 +2176,8 @@ func (m *model) Closed(conn protocol.Connection, err error) {
 		return
 	}
 
+	defer m.notifyDeviceIndex(deviceID)
+	delete(m.deviceIndexState(deviceID).secondary, connID)
 	closed := m.closed[connID]
 	delete(m.closed, connID)
 	delete(m.connections, connID)
