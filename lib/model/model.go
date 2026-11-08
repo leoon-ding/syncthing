@@ -146,7 +146,10 @@ type model struct {
 
 	// constant or concurrency safe fields
 	progressEmitter *ProgressEmitter
-	shortID         protocol.ShortID
+	// Serialize index negotiation and replay with registry replacement/close.
+	// Acquire before mut; never wait on this mutex while holding mut.
+	deviceIndexLocks sync.Map // device ID -> single index-lifecycle permit
+	shortID          protocol.ShortID
 	// globalRequestLimiter limits the amount of data in concurrent incoming
 	// requests
 	globalRequestLimiter *semaphore.Semaphore
@@ -292,6 +295,7 @@ func (m *model) serve(ctx context.Context) error {
 			l.Debugln(m, "fatal error, stopping", err)
 			return svcutil.AsFatalErr(err, svcutil.ExitError)
 		case <-m.folderAccess.Reopened():
+			m.retryPendingClusterConfigs()
 			ids := make([]protocol.DeviceID, 0)
 			m.mut.RLock()
 			for id := range m.deviceConnIDs {
@@ -1174,6 +1178,18 @@ func (m *model) IndexUpdate(conn protocol.Connection, idxUp *protocol.IndexUpdat
 }
 
 func (m *model) handleIndex(conn protocol.Connection, folder string, fs []protocol.FileInfo, update bool, prevSequence, lastSequence int64) error {
+	releaseLifecycle := m.lockDeviceIndex(conn.DeviceID())
+	defer releaseLifecycle()
+	// Reopening also wakes the model loop, but a peer's first Index can arrive
+	// before that loop runs. Apply deferred negotiation before consuming data.
+	m.mut.RLock()
+	registry, registered := m.getIndexHandlerRLocked(conn)
+	m.mut.RUnlock()
+	if registered {
+		if err := m.retryPendingClusterConfig(registry); err != nil {
+			return err
+		}
+	}
 	scope, release, err := m.folderAccess.Admit(context.Background(), conn.DeviceID(), folder)
 	if err != nil {
 		return nil
@@ -1224,35 +1240,101 @@ type ClusterConfigReceivedEventData struct {
 	Device protocol.DeviceID `json:"device"`
 }
 
+// lockDeviceIndex serializes index negotiation, replay, and connection teardown
+// for one device. Never acquire the permit while holding m.mut. The channel
+// represents the admitted operation's completion, including during shutdown.
+func (m *model) lockDeviceIndex(device protocol.DeviceID) func() {
+	value, _ := m.deviceIndexLocks.LoadOrStore(device, make(chan struct{}, 1))
+	permit := value.(chan struct{})
+	permit <- struct{}{}
+	return func() { <-permit }
+}
+
 func (m *model) ClusterConfig(conn protocol.Connection, cm *protocol.ClusterConfig) error {
+	if cm.Secondary {
+		// Secondary announcements only mark the connection ready.
+		return nil
+	}
+	releaseLifecycle := m.lockDeviceIndex(conn.DeviceID())
+	defer releaseLifecycle()
+	registry := m.ensureIndexHandler(conn)
+	return m.applyClusterConfig(conn, cm, registry, nil)
+}
+
+// retryPendingClusterConfig requires the device index-lifecycle permit. A replacement
+// or closed connection must never replay an earlier connection's negotiation.
+func (m *model) retryPendingClusterConfig(registry *indexHandlerRegistry) error {
+	if registry.pendingClusterConfig == nil {
+		return nil
+	}
+	m.mut.RLock()
+	current, ok := m.indexHandlers.Get(registry.conn.DeviceID())
+	_, connected := m.connections[registry.conn.ConnectionID()]
+	m.mut.RUnlock()
+	if !ok || current != registry || !connected {
+		return nil
+	}
+	return m.applyClusterConfig(registry.conn, registry.pendingClusterConfig, registry, registry.pendingFolders)
+}
+
+func (m *model) retryPendingClusterConfigs() {
+	var registries []*indexHandlerRegistry
+	m.mut.RLock()
+	m.indexHandlers.Each(func(_ protocol.DeviceID, r *indexHandlerRegistry) error {
+		registries = append(registries, r)
+		return nil
+	})
+	m.mut.RUnlock()
+	for _, r := range registries {
+		releaseLifecycle := m.lockDeviceIndex(r.conn.DeviceID())
+		err := m.retryPendingClusterConfig(r)
+		releaseLifecycle()
+		if err != nil {
+			r.conn.Close(err)
+		}
+	}
+}
+
+func (m *model) applyClusterConfig(conn protocol.Connection, cm *protocol.ClusterConfig, indexHandlerRegistry *indexHandlerRegistry, retry map[string]struct{}) error {
 	deviceID := conn.DeviceID()
+	original := cm
 	scopes := make(map[string]context.Context)
 	withheld := make(map[string]struct{})
+	pending := make(map[string]struct{})
 	if m.folderAccess != nil {
 		snapshot := *cm
 		snapshot.Folders = nil
 		for _, folder := range cm.Folders {
-			scope, release, err := m.folderAccess.Admit(context.Background(), conn.DeviceID(), folder.ID)
-			if err != nil {
+			if _, needed := retry[folder.ID]; retry != nil && !needed {
+				// Already applied folders are retained without resetting their
+				// indexes or replaying introducer/configuration side effects.
 				withheld[folder.ID] = struct{}{}
 				continue
 			}
+			scope, release, err := m.folderAccess.Admit(context.Background(), conn.DeviceID(), folder.ID)
+			if err != nil {
+				withheld[folder.ID] = struct{}{}
+				pending[folder.ID] = struct{}{}
+				continue
+			}
 			defer release()
+			if retry != nil {
+				// Reopening is not approval to introduce or auto-accept an
+				// unknown/revoked share from an old announcement.
+				if cfg, ok := m.cfg.Folder(folder.ID); !ok || !cfg.SharedWith(deviceID) {
+					withheld[folder.ID] = struct{}{}
+					continue
+				}
+			}
 			scopes[folder.ID] = scope //nolint:fatcontext // Independent folder borrows, not a parent chain; retain all until the snapshot is applied.
 			if scope.Err() == nil {
 				snapshot.Folders = append(snapshot.Folders, folder)
 			} else {
 				withheld[folder.ID] = struct{}{}
+				pending[folder.ID] = struct{}{}
 			}
 		}
 		cm = &snapshot
-	}
-
-	if cm.Secondary {
-		// No handling of secondary connection ClusterConfigs; they merely
-		// indicate the connection is ready to start.
-		l.Debugf("Skipping secondary ClusterConfig from %v at %s", deviceID.Short(), conn)
-		return nil
 	}
 
 	// Check the peer device's announced folders against our own. Emits events
@@ -1261,7 +1343,6 @@ func (m *model) ClusterConfig(conn protocol.Connection, cm *protocol.ClusterConf
 	// temporary indexes, subscribe the connection.
 
 	l.Debugf("Handling ClusterConfig from %v at %s", deviceID.Short(), conn)
-	indexHandlerRegistry := m.ensureIndexHandler(conn)
 
 	deviceCfg, ok := m.cfg.Device(deviceID)
 	if !ok {
@@ -1343,6 +1424,7 @@ func (m *model) ClusterConfig(conn protocol.Connection, cm *protocol.ClusterConf
 				folders = append(folders, folder)
 			} else {
 				withheld[folder.ID] = struct{}{}
+				pending[folder.ID] = struct{}{}
 			}
 		}
 		cm.Folders = folders
@@ -1408,9 +1490,28 @@ func (m *model) ClusterConfig(conn protocol.Connection, cm *protocol.ClusterConf
 		})
 	}
 
+	indexHandlerRegistry.pendingClusterConfig = nil
+	indexHandlerRegistry.pendingFolders = pending
+	if len(pending) > 0 {
+		// Own a snapshot independent of the protocol caller and of the slice
+		// filtering above. A new remote announcement replaces this snapshot,
+		// including real withdrawals while a local fence is still closed.
+		snapshot := *original
+		snapshot.Folders = slices.Clone(original.Folders)
+		for i := range snapshot.Folders {
+			snapshot.Folders[i].Devices = slices.Clone(snapshot.Folders[i].Devices)
+			for j := range snapshot.Folders[i].Devices {
+				d := &snapshot.Folders[i].Devices[j]
+				d.Addresses = slices.Clone(d.Addresses)
+				d.EncryptionPasswordToken = slices.Clone(d.EncryptionPasswordToken)
+			}
+		}
+		indexHandlerRegistry.pendingClusterConfig = &snapshot
+	}
 	return nil
 }
 
+// ensureIndexHandler requires the device index-lifecycle permit when replacing a registry.
 func (m *model) ensureIndexHandler(conn protocol.Connection) *indexHandlerRegistry {
 	deviceID := conn.DeviceID()
 	connID := conn.ConnectionID()
@@ -1958,6 +2059,10 @@ func (m *model) introduceDevice(device protocol.Device, introducerCfg config.Dev
 
 // Closed is called when a connection has been closed
 func (m *model) Closed(conn protocol.Connection, err error) {
+	// Wait for admitted replay/index work before removing its registry. A new
+	// primary cannot publish indexes until this cleanup releases the same lock.
+	releaseLifecycle := m.lockDeviceIndex(conn.DeviceID())
+	defer releaseLifecycle()
 	connID := conn.ConnectionID()
 	deviceID := conn.DeviceID()
 

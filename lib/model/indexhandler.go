@@ -505,14 +505,19 @@ func (s *indexHandler) String() string {
 }
 
 type indexHandlerRegistry struct {
-	evLogger      events.Logger
-	conn          protocol.Connection
-	sdb           db.DB
-	downloads     *deviceDownloadState
-	indexHandlers *serviceMap[string, *indexHandler]
-	startInfos    map[string]*clusterConfigDeviceInfo
-	folderStates  map[string]*indexHandlerFolderState
-	mut           sync.Mutex
+	// Protected by the model device index-lifecycle permit. Only the latest announcement is
+	// retained, and only locally withheld folders are retried. This metadata
+	// grants no access by itself.
+	pendingClusterConfig *protocol.ClusterConfig
+	pendingFolders       map[string]struct{}
+	evLogger             events.Logger
+	conn                 protocol.Connection
+	sdb                  db.DB
+	downloads            *deviceDownloadState
+	indexHandlers        *serviceMap[string, *indexHandler]
+	startInfos           map[string]*clusterConfigDeviceInfo
+	folderStates         map[string]*indexHandlerFolderState
+	mut                  sync.Mutex
 }
 
 type indexHandlerFolderState struct {
