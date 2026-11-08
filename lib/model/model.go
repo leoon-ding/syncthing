@@ -1536,7 +1536,7 @@ func (m *model) ensureIndexHandler(conn protocol.Connection) *indexHandlerRegist
 	}
 
 	// Create a new index handler for this device.
-	indexHandlerRegistry = newIndexHandlerRegistry(conn, m.sdb, m.deviceDownloads[deviceID], m.evLogger)
+	indexHandlerRegistry = newIndexHandlerRegistry(conn, m.sdb, m.deviceDownloads[deviceID], m.evLogger, m.folderAccess)
 	for id, fcfg := range m.folderCfgs {
 		l.Debugln("Registering folder", id, "for", deviceID.Short())
 		runner, _ := m.folderRunners.Get(id)

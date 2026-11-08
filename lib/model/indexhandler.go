@@ -24,6 +24,8 @@ import (
 )
 
 type indexHandler struct {
+	folderAccess             *FolderAccess
+	localIndexID             protocol.IndexID
 	conn                     protocol.Connection
 	downloads                *deviceDownloadState
 	folder                   string
@@ -130,6 +132,7 @@ func newIndexHandler(conn protocol.Connection, downloads *deviceDownloadState, f
 
 	return &indexHandler{
 		conn:                     conn,
+		localIndexID:             myIndexID,
 		downloads:                downloads,
 		folder:                   folder.ID,
 		folderIsReceiveEncrypted: folder.Type == config.FolderTypeReceiveEncrypted,
@@ -157,10 +160,12 @@ func (s *indexHandler) waitWhilePaused(ctx context.Context) error {
 		}
 	}
 
-	return nil
+	return ctx.Err()
 }
 
 func (s *indexHandler) Serve(ctx context.Context) (err error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	l.Debugf("Starting index handler for %s to %s at %s (localPrevSequence=%d)", s.folder, s.conn.DeviceID().Short(), s.conn, s.localPrevSequence)
 	stop := make(chan struct{})
 
@@ -174,9 +179,14 @@ func (s *indexHandler) Serve(ctx context.Context) (err error) {
 	go func() {
 		select {
 		case <-ctx.Done():
-			s.cond.Broadcast()
+		case <-s.conn.Closed():
 		case <-stop:
+			return
 		}
+		cancel()
+		s.cond.L.Lock()
+		s.cond.Broadcast()
+		s.cond.L.Unlock()
 	}()
 
 	// We need to send one index, regardless of whether there is something to send or not
@@ -255,9 +265,64 @@ func (s *indexHandler) pause() {
 	s.cond.L.Unlock()
 }
 
-// sendIndexTo sends file infos with a sequence number higher than prevSequence and
-// returns the highest sent sequence number.
+var errIndexReset = errors.New("local index reset while admission was closed")
+
+func (s *indexHandler) waitForIndexAdmission(ctx context.Context) error {
+	if err := s.waitWhilePaused(ctx); err != nil {
+		return err
+	}
+	return s.folderAccess.wait(ctx, s.conn.DeviceID(), s.folder)
+}
+
+// Retain a borrow across the index-ID check and the read/write it protects.
+// Reset/revoke cannot finish between checking the generation and using it.
+func (s *indexHandler) indexAdmission(ctx context.Context) (context.Context, func(), error) {
+	scope, release, err := s.folderAccess.Admit(ctx, s.conn.DeviceID(), s.folder)
+	if err != nil {
+		return nil, nil, err
+	}
+	if s.folderAccess == nil {
+		return scope, release, nil
+	}
+	id, err := s.sdb.GetIndexID(s.folder, protocol.LocalDeviceID)
+	if err == nil && id != s.localIndexID {
+		s.localIndexID = id
+		s.localPrevSequence, s.sentPrevSequence = 0, 0
+		err = errIndexReset
+	}
+	if err != nil {
+		release()
+		return nil, nil, err
+	}
+	return scope, release, nil
+}
+
+// sendIndexTo advances the sender only after writing the batch. Admission
+// closure retains unsent work; a reset discards batches from the old index ID.
 func (s *indexHandler) sendIndexTo(ctx context.Context) error {
+	for {
+		if err := s.waitForIndexAdmission(ctx); err != nil {
+			return err
+		}
+		err := s.sendIndexBatch(ctx)
+		if !errors.Is(err, errIndexReset) && !(s.folderAccess != nil && errors.Is(err, protocol.ErrFolderAccessClosed)) {
+			return err
+		}
+	}
+}
+
+func (s *indexHandler) sendIndexBatch(ctx context.Context) (err error) {
+	scope, release, err := s.indexAdmission(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	startSequence := s.localPrevSequence
+	defer func() {
+		if errors.Is(err, protocol.ErrFolderAccessClosed) {
+			s.localPrevSequence = startSequence
+		}
+	}()
 	initial := s.localPrevSequence == 0
 	batch := NewFileInfoBatch(nil)
 	var batchError error
@@ -279,25 +344,38 @@ func (s *indexHandler) sendIndexTo(ctx context.Context) error {
 		l.Debugf("%v: Sending %d files (<%d bytes)", s, len(fs), batch.Size())
 
 		lastSequence := fs[len(fs)-1].Sequence
-		var err error
-		if initial {
-			initial = false
-			err = s.conn.Index(ctx, &protocol.Index{
-				Folder:       s.folder,
-				Files:        fs,
-				LastSequence: lastSequence,
-			})
-		} else {
-			err = s.conn.IndexUpdate(ctx, &protocol.IndexUpdate{
-				Folder:       s.folder,
-				Files:        fs,
-				PrevSequence: s.sentPrevSequence,
-				LastSequence: lastSequence,
-			})
-		}
-		if err != nil {
-			batchError = err
-			return err
+		// Keep the same batch and initial/full-index flag until a successful
+		// write. The iterator cursor has already advanced; returning to it on
+		// temporary denial would skip this batch.
+		for {
+			sendScope, finish, err := s.indexAdmission(ctx)
+			if err == nil {
+				if initial {
+					err = s.conn.Index(sendScope, &protocol.Index{Folder: s.folder, Files: fs, LastSequence: lastSequence})
+				} else {
+					err = s.conn.IndexUpdate(sendScope, &protocol.IndexUpdate{Folder: s.folder, Files: fs, PrevSequence: s.sentPrevSequence, LastSequence: lastSequence})
+				}
+				// Parent cancellation from a fence must keep its typed cause.
+				if errors.Is(err, context.Canceled) && sendScope.Err() != nil {
+					err = context.Cause(sendScope)
+				}
+				finish()
+			}
+			if err == nil {
+				initial = false
+				break
+			}
+			if s.folderAccess == nil || !errors.Is(err, protocol.ErrFolderAccessClosed) {
+				batchError = err
+				return err
+			}
+			waitStarted := time.Now()
+			slog.Info("Index send deferred by folder admission", s.conn.DeviceID().LogAttr(), "folder", s.folder)
+			if err := s.waitForIndexAdmission(ctx); err != nil {
+				batchError = err
+				return err
+			}
+			slog.Info("Index send admission restored", s.conn.DeviceID().LogAttr(), "folder", s.folder, "wait", time.Since(waitStarted))
 		}
 		s.sentPrevSequence = lastSequence
 		return nil
@@ -307,6 +385,9 @@ func (s *indexHandler) sendIndexTo(ctx context.Context) error {
 	previousWasDelete := false
 
 	for fi, err := range itererr.Zip(s.sdb.AllLocalFilesBySequence(s.folder, protocol.LocalDeviceID, s.localPrevSequence+1, MaxBatchSizeFiles+1)) {
+		if scope.Err() != nil {
+			return context.Cause(scope)
+		}
 		if err != nil {
 			return err
 		}
@@ -350,6 +431,11 @@ func (s *indexHandler) sendIndexTo(ctx context.Context) error {
 
 		batch.Append(f)
 	}
+	if scope.Err() != nil {
+		return context.Cause(scope)
+	}
+	// Do not retain a read borrow while the batch waits for admission.
+	release()
 	return batch.Flush()
 }
 
@@ -505,6 +591,7 @@ func (s *indexHandler) String() string {
 }
 
 type indexHandlerRegistry struct {
+	folderAccess *FolderAccess
 	// Protected by the model device index-lifecycle permit. Only the latest announcement is
 	// retained, and only locally withheld folders are retried. This metadata
 	// grants no access by itself.
@@ -525,8 +612,9 @@ type indexHandlerFolderState struct {
 	runner service
 }
 
-func newIndexHandlerRegistry(conn protocol.Connection, sdb db.DB, downloads *deviceDownloadState, evLogger events.Logger) *indexHandlerRegistry {
+func newIndexHandlerRegistry(conn protocol.Connection, sdb db.DB, downloads *deviceDownloadState, evLogger events.Logger, access *FolderAccess) *indexHandlerRegistry {
 	r := &indexHandlerRegistry{
+		folderAccess:  access,
 		evLogger:      evLogger,
 		conn:          conn,
 		sdb:           sdb,
@@ -557,6 +645,7 @@ func (r *indexHandlerRegistry) startLocked(folder config.FolderConfiguration, ru
 	if err != nil {
 		return err
 	}
+	is.folderAccess = r.folderAccess
 	r.indexHandlers.Add(folder.ID, is)
 
 	// This new connection might help us get in sync.

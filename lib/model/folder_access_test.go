@@ -10,15 +10,19 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"iter"
 	"runtime"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/syncthing/syncthing/internal/db"
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/protocol"
+	pm "github.com/syncthing/syncthing/lib/protocol/mocks"
 	"github.com/syncthing/syncthing/lib/semaphore"
 	"github.com/syncthing/syncthing/lib/testutil"
 )
@@ -380,3 +384,297 @@ func TestFolderAccessUnsentAnnouncementDrainIsolation(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestFolderAccessWaitBroadcastAndBroaderFence(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		g := new(FolderAccess)
+		g.Seal(device1, "default")
+		g.Seal(device1, "")
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := make(chan error, 8)
+		for range 8 {
+			go func() { done <- g.wait(ctx, device1, "default") }()
+		}
+		synctest.Wait()
+		// Waiting senders do not hold admission and cannot prevent draining.
+		if err := g.Drain(ctx, device1, ""); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.Open(device1, "default"); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		select {
+		case <-done:
+			t.Fatal("narrow reopen bypassed device fence")
+		default:
+		}
+		if err := g.Open(device1, ""); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		for range 8 {
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+		}
+		g.Seal(device1, "default")
+		go func() { done <- g.wait(ctx, device1, "default") }()
+		synctest.Wait()
+		cancel()
+		if err := <-done; !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+	})
+}
+
+// A tiny deterministic index store isolates admission recovery from scanner IO.
+type admissionIndexDB struct {
+	db.DB
+	id          protocol.IndexID
+	sequence    int64
+	beforeYield func()
+}
+
+func (d *admissionIndexDB) GetIndexID(string, protocol.DeviceID) (protocol.IndexID, error) {
+	return d.id, nil
+}
+func (d *admissionIndexDB) GetDeviceSequence(string, protocol.DeviceID) (int64, error) {
+	return d.sequence, nil
+}
+func (d *admissionIndexDB) AllLocalFilesBySequence(_ string, _ protocol.DeviceID, start int64, _ int) (iter.Seq[protocol.FileInfo], func() error) {
+	return func(yield func(protocol.FileInfo) bool) {
+		if d.beforeYield != nil {
+			d.beforeYield()
+		}
+		for seq := start; seq <= d.sequence; seq++ {
+			if !yield(protocol.FileInfo{Name: fmt.Sprintf("file-%d-%d", d.id, seq), Sequence: seq, Deleted: true}) {
+				return
+			}
+		}
+	}, func() error { return nil }
+}
+
+type admissionIndexRunner struct{ service }
+
+func (*admissionIndexRunner) SchedulePull() {}
+
+func TestFolderAccessIndexSenderRecovery(t *testing.T) {
+	for _, mode := range []string{"initial-closed", "initial-canceled", "incremental-canceled", "repeated-cancel", "reset", "pause", "scan-canceled", "remove", "disconnect"} {
+		t.Run(mode, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				g := new(FolderAccess)
+				cfg := newFolderConfig()
+				store := &admissionIndexDB{id: 17, sequence: 2}
+				conn := new(pm.Connection)
+				conn.DeviceIDReturns(device1)
+				conn.StringReturns("admission-index")
+				closed := make(chan struct{})
+				conn.ClosedReturns(closed)
+				attempts, sent := 0, 0
+				var successful []protocol.FileInfo
+				var wasUpdate bool
+				canceledOnce := false
+				send := func(ctx context.Context, folder string, files []protocol.FileInfo, update bool) error {
+					attempts++
+					scope, release, err := g.Admit(ctx, device1, folder)
+					if err != nil {
+						return err
+					}
+					defer release()
+					if mode != "initial-closed" && mode != "scan-canceled" && (!canceledOnce || mode == "repeated-cancel" && attempts == 2) {
+						canceledOnce = true
+						g.Seal(device1, folder)
+						return context.Cause(scope)
+					}
+					sent++
+					successful = append(successful, files...)
+					wasUpdate = update
+					return nil
+				}
+				conn.IndexCalls(func(ctx context.Context, i *protocol.Index) error { return send(ctx, i.Folder, i.Files, false) })
+				conn.IndexUpdateCalls(func(ctx context.Context, i *protocol.IndexUpdate) error { return send(ctx, i.Folder, i.Files, true) })
+				if mode == "initial-closed" {
+					g.Seal(device1, cfg.ID)
+				}
+				if mode == "scan-canceled" {
+					store.beforeYield = func() { store.beforeYield = nil; g.Seal(device1, cfg.ID) }
+				}
+				r := newIndexHandlerRegistry(conn, store, nil, events.NoopLogger, g)
+				r.RegisterFolderState(cfg, new(admissionIndexRunner))
+				info := &clusterConfigDeviceInfo{remote: protocol.Device{IndexID: 17}}
+				if mode == "incremental-canceled" {
+					info.local = protocol.Device{IndexID: 17, MaxSequence: 1}
+				}
+				r.AddIndexInfo(cfg.ID, info)
+				ctx, cancel := context.WithCancel(context.Background())
+				done := make(chan struct{})
+				go func() { defer close(done); _ = r.Serve(ctx) }()
+				defer func() { cancel(); <-done }()
+				synctest.Wait()
+				if sent != 0 {
+					t.Fatal("sent through fence")
+				}
+				if err := g.Drain(ctx, device1, cfg.ID); err != nil {
+					t.Fatal(err)
+				}
+				if mode == "remove" {
+					r.Remove(cfg.ID)
+				}
+				if mode == "disconnect" {
+					close(closed)
+					synctest.Wait()
+				}
+				if mode == "reset" {
+					store.id = 18
+					store.sequence = 1
+				}
+				if mode == "pause" {
+					cfg.Paused = true
+					r.RegisterFolderState(cfg, new(admissionIndexRunner))
+					if err := g.CommitPause(device1, cfg.ID); err != nil {
+						t.Fatal(err)
+					}
+					synctest.Wait()
+					if sent != 0 {
+						t.Fatal("sent while paused")
+					}
+					cfg.Paused = false
+					r.RegisterFolderState(cfg, new(admissionIndexRunner))
+				}
+				if err := g.Open(device1, cfg.ID); err != nil {
+					t.Fatal(err)
+				}
+				synctest.Wait()
+				if mode == "repeated-cancel" {
+					if sent != 0 || attempts != 2 {
+						t.Fatalf("repeat attempts=%d sent=%d", attempts, sent)
+					}
+					if err := g.Open(device1, cfg.ID); err != nil {
+						t.Fatal(err)
+					}
+					synctest.Wait()
+				}
+				if mode == "remove" || mode == "disconnect" {
+					if sent != 0 {
+						t.Fatal("late reopen resurrected terminal sender")
+					}
+					return
+				}
+				want := 2
+				if mode == "incremental-canceled" || mode == "reset" {
+					want = 1
+				}
+				if sent != 1 || len(successful) != want {
+					t.Fatalf("sent=%d files=%v", sent, successful)
+				}
+				if wasUpdate != (mode == "incremental-canceled") {
+					t.Fatalf("wrong initial/delta flag: %v", wasUpdate)
+				}
+				if mode == "reset" && successful[0].Name != "file-18-1" {
+					t.Fatal("sent stale batch after reset")
+				}
+				h, ok := r.indexHandlers.Get(cfg.ID)
+				if !ok || h.sentPrevSequence != store.sequence {
+					t.Fatal("sender cursor did not recover")
+				}
+			})
+		})
+	}
+}
+
+// Exercise admission recovery through real BEP encoding/writing/dispatch, not
+// just a mock Index method. A blocked folder must not stall its sibling.
+func TestFolderAccessIndexRecoveryOnExistingBEP(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		g := new(FolderAccess)
+		g.Seal(device1, "default")
+		ar, aw := io.Pipe()
+		br, bw := io.Pipe()
+		receiver := &admissionIndexReceiver{received: make(chan string, 8)}
+		local := &admissionIndexReceiver{received: make(chan string, 8)}
+		conn := protocol.NewConnection(device1, ar, bw, testutil.NoopCloser{}, local, new(pm.ConnectionInfo), protocol.CompressionNever, protocol.NewKeyGenerator(), func(ctx context.Context, folder string) (context.Context, func(), error) {
+			return g.Admit(ctx, device1, folder)
+		})
+		remote := protocol.NewConnection(myID, br, aw, testutil.NoopCloser{}, receiver, new(pm.ConnectionInfo), protocol.CompressionNever, protocol.NewKeyGenerator())
+		conn.Start()
+		remote.Start()
+		defer func() {
+			ar.Close()
+			aw.Close()
+			br.Close()
+			bw.Close()
+			conn.Close(io.EOF)
+			remote.Close(io.EOF)
+			<-conn.Closed()
+			<-remote.Closed()
+		}()
+		conn.ClusterConfig(&protocol.ClusterConfig{}, nil)
+		remote.ClusterConfig(&protocol.ClusterConfig{}, nil)
+		store := &admissionIndexDB{id: 17, sequence: 2}
+		sender, err := newIndexHandler(conn, nil, newFolderConfig(), store, new(admissionIndexRunner), &clusterConfigDeviceInfo{remote: protocol.Device{IndexID: 17}}, events.NoopLogger)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sender.folderAccess = g
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := make(chan error, 1)
+		go func() { done <- sender.sendIndexTo(ctx) }()
+		synctest.Wait()
+		select {
+		case <-done:
+			t.Fatal("sender did not wait for admission")
+		default:
+		}
+		if err := conn.Index(ctx, &protocol.Index{Folder: "sibling"}); err != nil {
+			t.Fatal(err)
+		}
+		if got := <-receiver.received; got != "index:sibling:0" {
+			t.Fatal(got)
+		}
+		if err := g.Drain(ctx, device1, "default"); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.Open(device1, "default"); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+		if got := <-receiver.received; got != "index:default:2" {
+			t.Fatal(got)
+		}
+		store.sequence = 3
+		if err := sender.sendIndexTo(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if got := <-receiver.received; got != "update:default:1" {
+			t.Fatal(got)
+		}
+		select {
+		case <-conn.Closed():
+			t.Fatal("recovery closed BEP")
+		default:
+		}
+	})
+}
+
+type admissionIndexReceiver struct {
+	protocol.Model
+	received chan string
+}
+
+func (r *admissionIndexReceiver) Index(_ protocol.Connection, i *protocol.Index) error {
+	r.received <- fmt.Sprintf("index:%s:%d", i.Folder, len(i.Files))
+	return nil
+}
+func (r *admissionIndexReceiver) IndexUpdate(_ protocol.Connection, i *protocol.IndexUpdate) error {
+	r.received <- fmt.Sprintf("update:%s:%d", i.Folder, len(i.Files))
+	return nil
+}
+func (*admissionIndexReceiver) ClusterConfig(protocol.Connection, *protocol.ClusterConfig) error {
+	return nil
+}
+func (*admissionIndexReceiver) Closed(protocol.Connection, error) {}

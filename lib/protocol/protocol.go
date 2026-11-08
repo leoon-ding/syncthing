@@ -198,9 +198,10 @@ type asyncResult struct {
 }
 
 type asyncMessage struct {
-	ctx  context.Context //nolint:containedctx // Queue retains the admission scope until write completion or cancellation.
-	msg  proto.Message
-	done chan struct{} // done closes when we're done sending the message
+	ctx     context.Context //nolint:containedctx // Queue retains the admission scope until write completion or cancellation.
+	msg     proto.Message
+	done    chan struct{} // done closes when we're done sending the message
+	written chan error    // optional buffered result: nil only after a complete write
 }
 
 const (
@@ -372,14 +373,7 @@ func (c *rawConnection) Index(ctx context.Context, idx *Index) error {
 			return err
 		}
 		defer release()
-		if err := c.lockIndex(scope); err != nil {
-			return err
-		}
-		defer func() { <-c.idxGate }()
-		done := make(chan struct{})
-		c.send(scope, idx.toWire(), done)
-		<-done
-		return scope.Err()
+		return c.sendAdmittedIndex(scope, idx.toWire())
 	}
 	if err := c.lockIndex(ctx); err != nil {
 		return err
@@ -404,14 +398,7 @@ func (c *rawConnection) IndexUpdate(ctx context.Context, idxUp *IndexUpdate) err
 			return err
 		}
 		defer release()
-		if err := c.lockIndex(scope); err != nil {
-			return err
-		}
-		defer func() { <-c.idxGate }()
-		done := make(chan struct{})
-		c.send(scope, idxUp.toWire(), done)
-		<-done
-		return scope.Err()
+		return c.sendAdmittedIndex(scope, idxUp.toWire())
 	}
 	if err := c.lockIndex(ctx); err != nil {
 		return err
@@ -419,6 +406,30 @@ func (c *rawConnection) IndexUpdate(ctx context.Context, idxUp *IndexUpdate) err
 	defer func() { <-c.idxGate }()
 	c.send(ctx, idxUp.toWire(), nil)
 	return nil
+}
+
+// sendAdmittedIndex retains the borrow until the writer actually finishes.
+// A canceled queued message is retryable; a fully written message stays successful
+// even if admission was revoked during the write. This is not a remote ACK.
+func (c *rawConnection) sendAdmittedIndex(scope context.Context, msg proto.Message) error {
+	if err := c.lockIndex(scope); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return context.Cause(scope)
+		}
+		return err
+	}
+	defer func() { <-c.idxGate }()
+	written := make(chan error, 1)
+	select {
+	case c.outbox <- asyncMessage{ctx: scope, msg: msg, written: written}:
+		// outbox is unbuffered: the writer now owns this message and will
+		// complete it even when the scope or connection is canceled.
+		return <-written
+	case <-c.closed:
+		return ErrClosed
+	case <-scope.Done():
+		return context.Cause(scope)
+	}
 }
 
 // Request returns the bytes for the specified block after fetching them from the connected peer.
@@ -936,6 +947,9 @@ initial:
 				if response, ok := hm.msg.(*bep.Response); ok {
 					hm.msg = (&Response{ID: int(response.Id), Code: errorToCode(ErrGeneric)}).toWire()
 				} else {
+					if hm.written != nil {
+						hm.written <- context.Cause(hm.ctx)
+					}
 					if hm.done != nil {
 						close(hm.done)
 					}
@@ -943,6 +957,9 @@ initial:
 				}
 			}
 			err := c.writeMessage(hm.msg)
+			if hm.written != nil {
+				hm.written <- err
+			}
 			if hm.done != nil {
 				close(hm.done)
 			}

@@ -1248,3 +1248,95 @@ func TestRequestCancelResponseCloseRace(t *testing.T) {
 		}
 	}
 }
+
+// Acceptance into the writer is not proof that bytes were written. Cancellation
+// before write must be distinguishable from cancellation during a full write.
+func TestFolderIndexWriteOutcome(t *testing.T) {
+	for _, update := range []bool{false, true} {
+		for _, mode := range []string{"skipped", "written", "failed"} {
+			t.Run(fmt.Sprintf("update=%v/%s", update, mode), func(t *testing.T) {
+				c := getRawConnection(NewConnection(c0ID, bytes.NewReader(nil), io.Discard, testutil.NoopCloser{}, newTestModel(), new(mockedConnectionInfo), CompressionNever, testKeyGen))
+				scope, cancel := context.WithCancelCause(context.Background())
+				defer cancel(nil)
+				released := make(chan struct{})
+				c.folderAdmit = func(context.Context, string) (context.Context, func(), error) {
+					return scope, func() { close(released) }, nil
+				}
+				result := make(chan error, 1)
+				indexDone := make(chan struct{})
+				go func() {
+					defer close(indexDone)
+					if update {
+						result <- c.IndexUpdate(context.Background(), &IndexUpdate{Folder: "folder"})
+					} else {
+						result <- c.Index(context.Background(), &Index{Folder: "folder"})
+					}
+				}()
+				// Intercept the unbuffered handoff to deterministically order cancellation
+				// before the writer examines this exact queued message.
+				msg := <-c.outbox
+				if mode == "skipped" {
+					cancel(ErrFolderAccessClosed)
+				}
+				exited := make(chan struct{})
+				go func() { defer close(exited); c.writerLoop() }()
+				ccDone := make(chan struct{})
+				c.clusterConfigBox <- clusterConfigMessage{config: &ClusterConfig{}, done: ccDone}
+				<-ccDone
+				writer := &indexOutcomeWriter{entered: make(chan struct{}), resume: make(chan struct{}), fail: mode == "failed"}
+				c.cw = &countingWriter{Writer: writer}
+				var resumeOnce sync.Once
+				resume := func() { resumeOnce.Do(func() { close(writer.resume) }) }
+				defer func() { cancel(nil); resume(); c.internalClose(errManual); <-exited; <-indexDone }()
+				c.outbox <- msg
+				if mode != "skipped" {
+					<-writer.entered
+					cancel(ErrFolderAccessClosed)
+					select {
+					case <-released:
+						t.Fatal("released before actual write completion")
+					default:
+					}
+					resume()
+				}
+				err := <-result
+				switch mode {
+				case "skipped":
+					if !errors.Is(err, ErrFolderAccessClosed) {
+						t.Fatalf("skipped: %v", err)
+					}
+				case "written":
+					if err != nil {
+						t.Fatalf("complete write misreported as cancellation: %v", err)
+					}
+				case "failed":
+					if !errors.Is(err, io.ErrClosedPipe) {
+						t.Fatalf("write error lost: %v", err)
+					}
+				}
+				<-released
+				if mode == "failed" {
+					<-c.Closed()
+				} else {
+					c.internalClose(errManual)
+				}
+				<-exited
+			})
+		}
+	}
+}
+
+type indexOutcomeWriter struct {
+	entered, resume chan struct{}
+	once            sync.Once
+	fail            bool
+}
+
+func (w *indexOutcomeWriter) Write(p []byte) (int, error) {
+	w.once.Do(func() { close(w.entered) })
+	<-w.resume
+	if w.fail {
+		return 0, io.ErrClosedPipe
+	}
+	return len(p), nil
+}
