@@ -350,6 +350,7 @@ func (s *indexHandler) sendIndexBatch(ctx context.Context) (err error) {
 		for {
 			sendScope, finish, err := s.indexAdmission(ctx)
 			if err == nil {
+				slog.Info("Index batch ready", "device", s.conn.DeviceID().Short(), "connection_id", s.conn.ConnectionID(), "folder", s.folder, "initial", initial, "sequence", lastSequence, "items", len(fs), "event_time", time.Now().UTC().Format(time.RFC3339Nano))
 				if initial {
 					err = s.conn.Index(sendScope, &protocol.Index{Folder: s.folder, Files: fs, LastSequence: lastSequence})
 				} else {
