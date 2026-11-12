@@ -14,6 +14,7 @@ import (
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/protocol"
 	relayprotocol "github.com/syncthing/syncthing/lib/relay/protocol"
+	"github.com/syncthing/syncthing/lib/semaphore"
 	"github.com/syncthing/syncthing/lib/stats"
 	"net/url"
 	"sync"
@@ -709,6 +710,68 @@ func TestDialTimeIsNotAddedToReconnectDelay(t *testing.T) {
 				defer mu.Unlock()
 				if len(attempts) != 2 || attempts[1].Sub(attempts[0]) != expected {
 					t.Fatalf("dial time added to backoff: %v", attempts)
+				}
+			})
+		})
+	}
+}
+
+func TestDisconnectedPrivateRelayStartsWithWANAttempt(t *testing.T) {
+	for _, private := range []bool{false, true} {
+		name := "legacy remains serial"
+		if private {
+			name = "private relay does not wait for WAN timeout"
+		}
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				cfg := config.Wrap("", config.Configuration{Options: config.OptionsConfiguration{AlwaysLocalNets: []string{"10.20.30.0/24"}}}, protocol.LocalDeviceID, events.NoopLogger)
+				s := &service{lanChecker: &lanChecker{cfg: cfg}, connectionStatusHandler: newConnectionStatusHandler()}
+				if private {
+					s.options.Lookup = func(context.Context, protocol.DeviceID) ([]string, error) { return nil, nil }
+					s.options.SingleWANConnection = func() bool { return true }
+				}
+				attempts := make(chan string, 3)
+				releaseLAN, releaseWAN := make(chan struct{}), make(chan struct{})
+				s.options.BeforeDial = func(ctx context.Context, _ protocol.DeviceID, addr string, _ bool) (context.Context, func(), error) {
+					attempts <- addr
+					switch addr {
+					case "tcp://10.20.30.1:22000":
+						<-releaseLAN
+					case "tcp://192.0.2.1:22000":
+						<-releaseWAN
+					}
+					return nil, nil, errors.New("test dial failure")
+				}
+				target := func(addr string, priority int) dialTarget {
+					u, err := url.Parse(addr)
+					if err != nil {
+						t.Fatal(err)
+					}
+					return dialTarget{addr: addr, uri: u, priority: priority}
+				}
+				targets := []dialTarget{target("tcp://10.20.30.1:22000", 10), target("tcp://192.0.2.1:22000", 30), target("private-relay://192.0.2.2:22067", 50)}
+				done := make(chan struct{})
+				go func() {
+					defer close(done)
+					s.dialParallel(context.Background(), protocol.LocalDeviceID, targets, semaphore.New(8))
+				}()
+				synctest.Wait()
+				if len(attempts) != 1 || <-attempts != targets[0].addr {
+					t.Error("LAN must get its original first attempt")
+				}
+				close(releaseLAN)
+				synctest.Wait()
+				want := 1
+				if private {
+					want = 2
+				}
+				if len(attempts) != want {
+					t.Errorf("got %d WAN attempts before direct completed, want %d", len(attempts), want)
+				}
+				close(releaseWAN)
+				<-done
+				if targets[2].priority != 50 {
+					t.Error("relay connection priority changed")
 				}
 			})
 		})

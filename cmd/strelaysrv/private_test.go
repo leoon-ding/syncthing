@@ -63,6 +63,12 @@ func TestPrivateAllocationReplayQuotaAndRelease(t *testing.T) {
 			t.Fatal(e)
 		}
 	}
+	if _, e := p.register(source, mint("join", source, "", 20), make(chan any)); !errors.Is(e, errJoinRegistrationActive) || !errors.Is(e, protocol.ErrPermit) {
+		t.Fatalf("duplicate registration reason: %v", e)
+	}
+	if _, e := p.register(source, mint("join", target, "", 21), make(chan any)); !errors.Is(e, errJoinPermit) || !errors.Is(e, protocol.ErrPermit) {
+		t.Fatalf("invalid permit reason: %v", e)
+	}
 	var sessions []*session
 	defer func() {
 		for _, s := range sessions {

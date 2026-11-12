@@ -1298,11 +1298,44 @@ func (s *service) dialWithAdmission(ctx context.Context, target dialTarget) (res
 	return conn, nil
 }
 
+// privateRelayDialPriority lets the authenticated relay start with the first
+// WAN direct attempt when the device is disconnected. The actual connection
+// priority is unchanged, so an established relay can still be upgraded.
+func (s *service) privateRelayDialPriority(deviceID protocol.DeviceID, targets []dialTarget) int {
+	const noPromotion = math.MaxInt
+	if s.options.Lookup == nil || !s.singleWANConnection() {
+		return noPromotion
+	}
+	if current, _, _, _ := s.admissionConnections(deviceID, true); current != 0 {
+		return noPromotion
+	}
+	priority := noPromotion
+	for _, tgt := range targets {
+		if tgt.uri == nil {
+			continue
+		}
+		switch tgt.uri.Scheme {
+		case "tcp", "tcp4", "tcp6", "quic", "quic4", "quic6":
+			ip := net.ParseIP(tgt.uri.Hostname())
+			if ip == nil || s.lanChecker == nil || s.lanChecker.isLAN(&net.IPAddr{IP: ip}) {
+				continue
+			}
+			priority = min(priority, tgt.priority)
+		}
+	}
+	return priority
+}
+
 func (s *service) dialParallel(ctx context.Context, deviceID protocol.DeviceID, dialTargets []dialTarget, parentSema *semaphore.Semaphore) (internalConn, bool) {
 	// Group targets into buckets by priority
 	dialTargetBuckets := make(map[int][]dialTarget, len(dialTargets))
+	relayPriority := s.privateRelayDialPriority(deviceID, dialTargets)
 	for _, tgt := range dialTargets {
-		dialTargetBuckets[tgt.priority] = append(dialTargetBuckets[tgt.priority], tgt)
+		priority := tgt.priority
+		if tgt.uri != nil && tgt.uri.Scheme == "private-relay" {
+			priority = min(priority, relayPriority)
+		}
+		dialTargetBuckets[priority] = append(dialTargetBuckets[priority], tgt)
 	}
 
 	// Get all available priorities
