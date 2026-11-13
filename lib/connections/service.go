@@ -148,6 +148,10 @@ type Options struct {
 	STUNServers             func() []string
 	// Lookup supplies non-persistent hints in addition to existing discovery.
 	Lookup func(context.Context, protocol.DeviceID) ([]string, error)
+	// LookupChanged closes on a changed candidate set. Zero device watches all
+	// peers. Notifications do not reset failed-address backoff or authorize dials.
+	LookupChanged  func(protocol.DeviceID) <-chan struct{}
+	LookupRecovery func(protocol.DeviceID, bool)
 	// BeforeDial reserves an attempt. The returned release is called after the
 	// dial and identity check finish, including every failure path.
 	BeforeDial func(context.Context, protocol.DeviceID, string, bool) (context.Context, func(), error)
@@ -553,6 +557,33 @@ func (s *service) handleHellos(ctx context.Context) error {
 	}
 }
 
+func (s *service) lookupChanged(id protocol.DeviceID) <-chan struct{} {
+	if s.options.LookupChanged == nil {
+		return nil
+	}
+	return s.options.LookupChanged(id)
+}
+
+// Cancel only this peer's obsolete attempts and join the watcher on all exits.
+func cancelOnHintsChanged(ctx context.Context, changed <-chan struct{}) (context.Context, func()) {
+	if changed == nil {
+		return ctx, func() {}
+	}
+	child, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	stop := make(chan struct{})
+	go func() {
+		defer close(done)
+		select {
+		case <-changed:
+			cancel()
+		case <-child.Done():
+		case <-stop:
+		}
+	}()
+	return child, func() { close(stop); <-done; cancel() }
+}
+
 func (s *service) connect(ctx context.Context) error {
 	// Map of when to earliest dial each given device + address again
 	nextDialAt := make(nextDialRegistry)
@@ -578,6 +609,7 @@ func (s *service) connect(ctx context.Context) error {
 		now := time.Now()
 
 		// Attempt to dial all devices that are unconnected or can be connection-upgraded
+		changed := s.lookupChanged(protocol.DeviceID{})
 		lookupPending := s.dialDevices(ctx, now, cfg, bestDialerPriority, nextDialAt, isInitialRampup)
 
 		var sleep time.Duration
@@ -609,6 +641,8 @@ func (s *service) connect(ctx context.Context) error {
 
 		timeout := time.NewTimer(sleep)
 		select {
+		case <-changed:
+			timeout.Stop()
 		case <-s.dialNow:
 			// Remove affected devices from nextDialAt to dial immediately,
 			// regardless of when we last dialed it (there's cool down in the
@@ -660,6 +694,7 @@ func (s *service) dialDevices(ctx context.Context, now time.Time, cfg config.Con
 	stats, _ := s.model.DeviceStatistics()
 
 	queue := make(dialQueue, 0, len(cfg.Devices))
+	changedPeers := make(map[protocol.DeviceID]<-chan struct{})
 	for _, deviceCfg := range cfg.Devices {
 		// Don't attempt to connect to ourselves...
 		if deviceCfg.DeviceID == s.myID {
@@ -675,6 +710,11 @@ func (s *service) dialDevices(ctx context.Context, now time.Time, cfg config.Con
 		// for dialer priority.
 		priorityCutoff := worstDialerPriority
 		singleWAN := s.singleWANConnection()
+		if s.options.LookupRecovery != nil {
+			current, _, _, _ := s.admissionConnections(deviceCfg.DeviceID, singleWAN)
+			s.options.LookupRecovery(deviceCfg.DeviceID, current == 0)
+		}
+
 		if currentConns, worst, _, _ := s.admissionConnections(deviceCfg.DeviceID, singleWAN); currentConns > 0 {
 			// Set the priority cutoff to the current connection's priority,
 			// so that we don't attempt any dialers with worse priority.
@@ -693,9 +733,10 @@ func (s *service) dialDevices(ctx context.Context, now time.Time, cfg config.Con
 			}
 		}
 
+		changedPeers[deviceCfg.DeviceID] = s.lookupChanged(deviceCfg.DeviceID)
 		dialTargets, pending := s.resolveDialTargets(ctx, now, cfg, deviceCfg, nextDialAt, initial, priorityCutoff, singleWAN)
 		lookupPending = lookupPending || pending
-		if len(dialTargets) > 0 {
+		if len(dialTargets) > 0 || s.options.LookupChanged != nil {
 			queue = append(queue, dialQueueEntry{
 				id:         deviceCfg.DeviceID,
 				lastSeen:   stats[deviceCfg.DeviceID].LastSeen,
@@ -718,10 +759,43 @@ func (s *service) dialDevices(ctx context.Context, now time.Time, cfg config.Con
 	numConns := 0
 	var numConnsMut sync.Mutex
 	dialSemaphore := semaphore.New(dialMaxParallel)
+	// Idle workers keep listening while another peer is still dialing. Once
+	// the batch has no active attempts, the outer loop owns the next wakeup.
+	idle := make(chan struct{})
+	active := len(queue)
+	var activeMu sync.Mutex
+	sealed := false
+	activity := func(delta int) bool {
+		activeMu.Lock()
+		defer activeMu.Unlock()
+		if delta > 0 && sealed {
+			return false
+		}
+		active += delta
+		if active == 0 && !sealed {
+			sealed = true
+			close(idle)
+		}
+		return true
+	}
 	dialWG := new(sync.WaitGroup)
 	dialCtx, dialCancel := context.WithCancel(ctx)
+	// Each queued device owns its registry during the batch. Merge only after
+	// all workers finish; candidate updates cannot race the scheduler's map.
+	registries := make([]nextDialRegistry, len(queue))
+	for i, entry := range queue {
+		registries[i] = make(nextDialRegistry)
+		if prior, ok := nextDialAt[entry.id]; ok {
+			registries[i][entry.id] = prior
+		}
+	}
 	defer func() {
 		dialWG.Wait()
+		for i, entry := range queue {
+			if prior, ok := registries[i][entry.id]; ok {
+				nextDialAt[entry.id] = prior
+			}
+		}
 		dialCancel()
 	}()
 	for i := range queue {
@@ -731,9 +805,9 @@ func (s *service) dialDevices(ctx context.Context, now time.Time, cfg config.Con
 		default:
 		}
 		dialWG.Add(1)
-		go func(entry dialQueueEntry) {
+		go func(entry dialQueueEntry, registry nextDialRegistry) {
 			defer dialWG.Done()
-			conn, ok := s.dialParallel(dialCtx, entry.id, entry.targets, dialSemaphore)
+			conn, ok := s.dialWithHintUpdates(dialCtx, entry, changedPeers[entry.id], registry, dialSemaphore, idle, activity)
 			if !ok {
 				return
 			}
@@ -749,9 +823,70 @@ func (s *service) dialDevices(ctx context.Context, now time.Time, cfg config.Con
 				}
 			}
 			numConnsMut.Unlock()
-		}(queue[i])
+		}(queue[i], registries[i])
 	}
 	return
+}
+
+// A peer whose hints changed rechecks them independently of other peers in
+// this batch. Existing address deadlines and connection admission still apply.
+func (s *service) dialWithHintUpdates(ctx context.Context, entry dialQueueEntry, changed <-chan struct{}, registry nextDialRegistry, sema *semaphore.Semaphore, idle <-chan struct{}, activity func(int) bool) (internalConn, bool) {
+	active := true
+	defer func() {
+		if active {
+			activity(-1)
+		}
+	}()
+	for ctx.Err() == nil {
+		attemptCtx, stop := cancelOnHintsChanged(ctx, changed)
+		conn, ok := s.dialParallel(attemptCtx, entry.id, entry.targets, sema)
+		stop()
+		active = false
+		activity(-1)
+		if ok {
+			return conn, true
+		}
+		select {
+		case <-changed:
+		default:
+			select {
+			case <-changed:
+			case <-idle:
+				return internalConn{}, false
+			case <-ctx.Done():
+				return internalConn{}, false
+			}
+		}
+		if ctx.Err() != nil {
+			break
+		}
+		if !activity(1) {
+			return internalConn{}, false
+		}
+		active = true
+		changed = s.lookupChanged(entry.id)
+		cfg := s.cfg.RawCopy()
+		found := false
+		for _, device := range cfg.Devices {
+			if device.DeviceID != entry.id {
+				continue
+			}
+			if device.Paused {
+				return internalConn{}, false
+			}
+			found = true
+			priority := worstDialerPriority
+			if current, worst, _, _ := s.admissionConnections(entry.id, s.singleWANConnection()); current > 0 {
+				priority = worst - cfg.Options.ConnectionPriorityUpgradeThreshold
+			}
+			entry.targets, _ = s.resolveDialTargets(ctx, time.Now(), cfg, device, registry, false, priority, s.singleWANConnection())
+			break
+		}
+		if !found {
+			break
+		}
+	}
+	return internalConn{}, false
 }
 
 func (s *service) resolveDialTargets(ctx context.Context, now time.Time, cfg config.Configuration, deviceCfg config.DeviceConfiguration, nextDialAt nextDialRegistry, initial bool, priorityCutoff int, singleWAN bool) ([]dialTarget, bool) {
