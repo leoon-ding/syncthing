@@ -350,7 +350,7 @@ func (s *indexHandler) sendIndexBatch(ctx context.Context) (err error) {
 		for {
 			sendScope, finish, err := s.indexAdmission(ctx)
 			if err == nil {
-				slog.Info("Index batch ready", "device", s.conn.DeviceID().Short(), "connection_id", s.conn.ConnectionID(), "folder", s.folder, "initial", initial, "sequence", lastSequence, "items", len(fs), "event_time", time.Now().UTC().Format(time.RFC3339Nano))
+				slog.InfoContext(ctx, "Index batch ready", "device", s.conn.DeviceID().Short(), "connection_id", s.conn.ConnectionID(), "folder", s.folder, "initial", initial, "sequence", lastSequence, "items", len(fs), "event_time", time.Now().UTC().Format(time.RFC3339Nano)) //nolint:sloglint // Preserve existing diagnostic field names used to correlate index and transport logs.
 				if initial {
 					err = s.conn.Index(sendScope, &protocol.Index{Folder: s.folder, Files: fs, LastSequence: lastSequence})
 				} else {
@@ -371,12 +371,12 @@ func (s *indexHandler) sendIndexBatch(ctx context.Context) (err error) {
 				return err
 			}
 			waitStarted := time.Now()
-			slog.Info("Index send deferred by folder admission", s.conn.DeviceID().LogAttr(), "folder", s.folder)
+			slog.InfoContext(ctx, "Index send deferred by folder admission", s.conn.DeviceID().LogAttr(), slog.String("folder", s.folder))
 			if err := s.waitForIndexAdmission(ctx); err != nil {
 				batchError = err
 				return err
 			}
-			slog.Info("Index send admission restored", s.conn.DeviceID().LogAttr(), "folder", s.folder, "wait", time.Since(waitStarted))
+			slog.InfoContext(ctx, "Index send admission restored", s.conn.DeviceID().LogAttr(), slog.String("folder", s.folder), slog.Duration("wait", time.Since(waitStarted)))
 		}
 		s.sentPrevSequence = lastSequence
 		return nil

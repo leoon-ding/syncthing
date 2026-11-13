@@ -1191,7 +1191,7 @@ func (m *model) handleIndex(conn protocol.Connection, folder string, fs []protoc
 	for {
 		releaseLifecycle := m.lockDeviceIndex(conn.DeviceID())
 		state := m.deviceIndexState(conn.DeviceID())
-		err, changed, otherClosed := m.handleIndexLocked(conn, folder, fs, update, prevSequence, lastSequence, scope, !waiting || state.revision == revision)
+		changed, otherClosed, err := m.handleIndexLocked(conn, folder, fs, update, prevSequence, lastSequence, scope, !waiting || state.revision == revision)
 		revision = state.revision
 		releaseLifecycle()
 		if changed == nil {
@@ -1229,25 +1229,25 @@ func (m *model) handleIndex(conn protocol.Connection, folder string, fs []protoc
 }
 
 // Requires the device index-lifecycle permit. A nil notification means final.
-func (m *model) handleIndexLocked(conn protocol.Connection, folder string, fs []protocol.FileInfo, update bool, prevSequence, lastSequence int64, scope context.Context, allowWait bool) (error, <-chan struct{}, []<-chan struct{}) {
+func (m *model) handleIndexLocked(conn protocol.Connection, folder string, fs []protocol.FileInfo, update bool, prevSequence, lastSequence int64, scope context.Context, allowWait bool) (<-chan struct{}, []<-chan struct{}, error) {
 	select {
 	case <-conn.Closed():
-		return protocol.ErrClosed, nil, nil
+		return nil, nil, protocol.ErrClosed
 	default:
 	}
 	if scope.Err() != nil {
-		return nil, nil, nil
+		return nil, nil, nil //nolint:nilerr // Revoked index work is discarded without closing the shared BEP connection.
 	}
 	m.mut.RLock()
 	registry, registered := m.getIndexHandlerRLocked(conn)
 	m.mut.RUnlock()
 	if registered {
 		if err := m.retryPendingClusterConfig(registry); err != nil {
-			return err, nil, nil
+			return nil, nil, err
 		}
 	}
 	if scope.Err() != nil {
-		return nil, nil, nil
+		return nil, nil, nil //nolint:nilerr // Revoked index work is discarded without closing the shared BEP connection.
 	}
 	op := "Index"
 	if update {
@@ -1256,10 +1256,10 @@ func (m *model) handleIndexLocked(conn protocol.Connection, folder string, fs []
 	deviceID := conn.DeviceID()
 	l.Debugf("%v (in): %s / %q: %d files", op, deviceID, folder, len(fs))
 	if cfg, ok := m.cfg.Folder(folder); !ok || !cfg.SharedWith(deviceID) {
-		slog.Warn("Operation for unexpected folder ID", slog.String("operation", op), cfg.LogAttr(), deviceID.LogAttr())
-		return fmt.Errorf("%s: %w", folder, ErrFolderMissing), nil, nil
+		slog.WarnContext(scope, "Operation for unexpected folder ID", slog.String("operation", op), cfg.LogAttr(), deviceID.LogAttr())
+		return nil, nil, fmt.Errorf("%s: %w", folder, ErrFolderMissing)
 	} else if cfg.Paused {
-		return fmt.Errorf("%s: %w", folder, ErrFolderPaused), nil, nil
+		return nil, nil, fmt.Errorf("%s: %w", folder, ErrFolderPaused)
 	}
 	m.mut.RLock()
 	registry, registered = m.getIndexHandlerRLocked(conn)
@@ -1284,16 +1284,16 @@ func (m *model) handleIndexLocked(conn protocol.Connection, folder string, fs []
 		registry.mut.Unlock()
 	}
 	if !hasHandler && len(others) > 0 {
-		return nil, state.changed, others
+		return state.changed, others, nil
 	}
 	if !registered {
 		m.evLogger.Log(events.Failure, "index sender does not exist for connection on which indexes were received")
-		return fmt.Errorf("%s: %w", folder, ErrFolderNotRunning), nil, nil
+		return nil, nil, fmt.Errorf("%s: %w", folder, ErrFolderNotRunning)
 	}
 	if scope.Err() != nil {
-		return nil, nil, nil
+		return nil, nil, nil //nolint:nilerr // Revoked index work is discarded without closing the shared BEP connection.
 	}
-	return registry.ReceiveIndex(folder, fs, update, op, prevSequence, lastSequence, scope), nil, nil
+	return nil, nil, registry.ReceiveIndex(folder, fs, update, op, prevSequence, lastSequence, scope)
 }
 
 type clusterConfigDeviceInfo struct {
@@ -1314,11 +1314,16 @@ type deviceIndexState struct {
 }
 
 func (m *model) deviceIndexState(device protocol.DeviceID) *deviceIndexState {
-	if value, ok := m.deviceIndexLocks.Load(device); ok {
-		return value.(*deviceIndexState)
+	value, loaded := m.deviceIndexLocks.Load(device)
+	if !loaded {
+		value, _ = m.deviceIndexLocks.LoadOrStore(device, &deviceIndexState{permit: make(chan struct{}, 1), changed: make(chan struct{}), secondary: make(map[string]bool)})
 	}
-	value, _ := m.deviceIndexLocks.LoadOrStore(device, &deviceIndexState{permit: make(chan struct{}, 1), changed: make(chan struct{}), secondary: make(map[string]bool)})
-	return value.(*deviceIndexState)
+	state, ok := value.(*deviceIndexState)
+	if !ok {
+		// Replacing a corrupt entry would create a second lifecycle permit.
+		panic("unexpected device index state type")
+	}
+	return state
 }
 
 // lockDeviceIndex must be acquired before m.mut. Waiters release it before
@@ -1374,7 +1379,8 @@ func (m *model) retryPendingClusterConfig(registry *indexHandlerRegistry) error 
 func (m *model) retryPendingClusterConfigs() {
 	var registries []*indexHandlerRegistry
 	m.mut.RLock()
-	m.indexHandlers.Each(func(_ protocol.DeviceID, r *indexHandlerRegistry) error {
+	// Each only forwards callback errors; this snapshot callback cannot fail.
+	_ = m.indexHandlers.Each(func(_ protocol.DeviceID, r *indexHandlerRegistry) error {
 		registries = append(registries, r)
 		return nil
 	})

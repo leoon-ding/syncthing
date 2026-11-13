@@ -825,7 +825,7 @@ func (s *service) dialDevices(ctx context.Context, now time.Time, cfg config.Con
 			numConnsMut.Unlock()
 		}(queue[i], registries[i])
 	}
-	return
+	return lookupPending
 }
 
 // A peer whose hints changed rechecks them independently of other peers in
