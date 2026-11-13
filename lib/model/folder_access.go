@@ -8,7 +8,6 @@ package model
 
 import (
 	"context"
-	"errors"
 	"sync"
 
 	"github.com/syncthing/syncthing/lib/protocol"
@@ -19,12 +18,13 @@ import (
 // only after a successful authorized configuration commit. Nil preserves the
 // standalone engine contract. Existing model sharing checks remain mandatory.
 type FolderAccess struct {
-	mu       sync.Mutex
-	sealed   map[folderScope]bool
-	paused   map[folderScope]bool
-	work     map[*folderWork]struct{}
-	changed  chan struct{}
-	reopened chan struct{}
+	mu        sync.Mutex
+	sealed    map[folderScope]bool
+	paused    map[folderScope]bool
+	work      map[*folderWork]struct{}
+	changed   chan struct{}
+	reopened  chan struct{}
+	available chan struct{} // broadcast to every waiting sender; not a work borrow
 }
 type folderScope struct {
 	device protocol.DeviceID
@@ -32,10 +32,10 @@ type folderScope struct {
 }
 type folderWork struct {
 	scope  folderScope
-	cancel context.CancelFunc
+	cancel context.CancelCauseFunc
 }
 
-var ErrFolderAccessClosed = errors.New("folder access sealed")
+var ErrFolderAccessClosed = protocol.ErrFolderAccessClosed
 
 func (g *FolderAccess) initLocked() {
 	if g.sealed == nil {
@@ -44,6 +44,7 @@ func (g *FolderAccess) initLocked() {
 		g.work = make(map[*folderWork]struct{})
 		g.changed = make(chan struct{})
 		g.reopened = make(chan struct{}, 1)
+		g.available = make(chan struct{})
 	}
 }
 
@@ -81,13 +82,13 @@ func (g *FolderAccess) admit(parent context.Context, device protocol.DeviceID, f
 			return nil, nil, ErrFolderAccessClosed
 		}
 	}
-	ctx, cancel := context.WithCancel(parent)
+	ctx, cancel := context.WithCancelCause(parent)
 	w := &folderWork{scope, cancel}
 	g.work[w] = struct{}{}
 	var once sync.Once
 	return ctx, func() {
 		once.Do(func() {
-			cancel()
+			cancel(nil)
 			g.mu.Lock()
 			delete(g.work, w)
 			close(g.changed)
@@ -110,7 +111,7 @@ func (g *FolderAccess) Seal(device protocol.DeviceID, folder string) {
 	g.sealed[scope] = true
 	for w := range g.work {
 		if scope.matches(w.scope) {
-			w.cancel()
+			w.cancel(ErrFolderAccessClosed)
 		}
 	}
 }
@@ -163,11 +164,47 @@ func (g *FolderAccess) Open(device protocol.DeviceID, folder string) error {
 	}
 	delete(g.sealed, scope)
 	delete(g.paused, scope)
+	close(g.available)
+	g.available = make(chan struct{})
 	select {
 	case g.reopened <- struct{}{}:
 	default:
 	}
 	return nil
+}
+
+// wait waits without borrowing admission or holding an engine/configuration lock.
+// The caller must acquire fresh admission afterwards. Opening a narrow scope
+// cannot bypass a broader pause/stop fence, and cancellation never opens a fence.
+func (g *FolderAccess) wait(ctx context.Context, device protocol.DeviceID, folder string) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if g == nil {
+			return nil
+		}
+		g.mu.Lock()
+		g.initLocked()
+		scope := folderScope{device, folder}
+		blocked := false
+		for s := range g.sealed {
+			blocked = blocked || s.matches(scope)
+		}
+		for s := range g.paused {
+			blocked = blocked || s.matches(scope)
+		}
+		ready := g.available
+		g.mu.Unlock()
+		if !blocked {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ready:
+		}
+	}
 }
 
 type admittedResponse struct {

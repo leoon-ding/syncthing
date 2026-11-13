@@ -9,9 +9,12 @@ package protocol
 import "errors"
 
 var (
-	ErrGeneric    = errors.New("generic error")
-	ErrNoSuchFile = errors.New("no such file")
-	ErrInvalid    = errors.New("file is invalid")
+	// ErrFolderAccessClosed is a local admission result, never a BEP wire error.
+	// Index senders may wait for admission and retry an unwritten batch.
+	ErrFolderAccessClosed = errors.New("folder access sealed")
+	ErrGeneric            = errors.New("generic error")
+	ErrNoSuchFile         = errors.New("no such file")
+	ErrInvalid            = errors.New("file is invalid")
 )
 
 func codeToError(code ErrorCode) error {

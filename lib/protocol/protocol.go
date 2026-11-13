@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"path"
 	"strings"
@@ -177,8 +178,16 @@ type rawConnection struct {
 
 	idxGate chan struct{} // serializes Index calls with cancelable admission
 
+	// Only successfully written primary announcements make a folder ready for
+	// indexes. Admission reopening alone cannot establish this wire ordering.
+	announcementMut       sync.Mutex
+	announcedFolders      map[string]struct{}
+	secondaryAnnouncement bool
+	announcementChanged   chan struct{}
+
 	inbox                 chan proto.Message
 	outbox                chan asyncMessage
+	indexBox              chan asyncMessage // unbuffered; idxGate preserves index order
 	closeBox              chan asyncMessage
 	clusterConfigBox      chan clusterConfigMessage
 	dispatcherLoopStopped chan struct{}
@@ -198,9 +207,11 @@ type asyncResult struct {
 }
 
 type asyncMessage struct {
-	ctx  context.Context //nolint:containedctx // Queue retains the admission scope until write completion or cancellation.
-	msg  proto.Message
-	done chan struct{} // done closes when we're done sending the message
+	ctx         context.Context //nolint:containedctx // Queue retains the admission scope until write completion or cancellation.
+	msg         proto.Message
+	done        chan struct{} // done closes when we're done sending the message
+	written     chan error    // optional buffered result: nil only after a complete write
+	indexQueued time.Time     // diagnostics only; zero for non-index messages
 }
 
 const (
@@ -271,9 +282,11 @@ func newRawConnection(deviceID DeviceID, reader io.Reader, writer io.Writer, clo
 		awaiting:              make(map[int]chan asyncResult),
 		inbox:                 make(chan proto.Message),
 		outbox:                make(chan asyncMessage),
+		indexBox:              make(chan asyncMessage),
 		closeBox:              make(chan asyncMessage),
 		clusterConfigBox:      make(chan clusterConfigMessage),
 		idxGate:               make(chan struct{}, 1),
+		announcementChanged:   make(chan struct{}),
 		dispatcherLoopStopped: make(chan struct{}),
 		closed:                make(chan struct{}),
 		compression:           compress,
@@ -372,14 +385,7 @@ func (c *rawConnection) Index(ctx context.Context, idx *Index) error {
 			return err
 		}
 		defer release()
-		if err := c.lockIndex(scope); err != nil {
-			return err
-		}
-		defer func() { <-c.idxGate }()
-		done := make(chan struct{})
-		c.send(scope, idx.toWire(), done)
-		<-done
-		return scope.Err()
+		return c.sendAdmittedIndex(scope, idx.Folder, idx.toWire())
 	}
 	if err := c.lockIndex(ctx); err != nil {
 		return err
@@ -404,14 +410,7 @@ func (c *rawConnection) IndexUpdate(ctx context.Context, idxUp *IndexUpdate) err
 			return err
 		}
 		defer release()
-		if err := c.lockIndex(scope); err != nil {
-			return err
-		}
-		defer func() { <-c.idxGate }()
-		done := make(chan struct{})
-		c.send(scope, idxUp.toWire(), done)
-		<-done
-		return scope.Err()
+		return c.sendAdmittedIndex(scope, idxUp.Folder, idxUp.toWire())
 	}
 	if err := c.lockIndex(ctx); err != nil {
 		return err
@@ -419,6 +418,115 @@ func (c *rawConnection) IndexUpdate(ctx context.Context, idxUp *IndexUpdate) err
 	defer func() { <-c.idxGate }()
 	c.send(ctx, idxUp.toWire(), nil)
 	return nil
+}
+
+var errIndexAnnouncementPending = errors.New("index awaits folder announcement")
+
+// sendAdmittedIndex retains the borrow until the writer actually finishes.
+// A canceled queued message is retryable; a fully written message stays successful
+// even if admission was revoked during the write. This is not a remote ACK.
+func (c *rawConnection) sendAdmittedIndex(scope context.Context, folder string, msg proto.Message) error {
+	for {
+		if err := c.waitFolderAnnouncement(scope, folder); err != nil {
+			return err
+		}
+		if err := c.lockIndex(scope); err != nil {
+			if scope.Err() != nil {
+				return context.Cause(scope)
+			}
+			return err
+		}
+		written := make(chan error, 1)
+		queued := time.Now()
+		c.logIndexWire("queued", msg, queued, time.Time{}, nil)
+		var err error
+		select {
+		case c.indexBox <- asyncMessage{ctx: scope, msg: msg, written: written, indexQueued: queued}:
+			// The writer owns completion after the unbuffered handoff, including
+			// cancellation and a withdrawal which overtook this queued index.
+			err = <-written
+		case <-c.closed:
+			err = ErrClosed
+			c.logIndexWire("queue_failed", msg, queued, time.Time{}, err)
+		case <-scope.Done():
+			err = context.Cause(scope)
+			c.logIndexWire("queue_failed", msg, queued, time.Time{}, err)
+		}
+		<-c.idxGate
+		if !errors.Is(err, errIndexAnnouncementPending) {
+			return err
+		}
+	}
+}
+
+func (c *rawConnection) waitFolderAnnouncement(ctx context.Context, folder string) error {
+	for {
+		if ctx.Err() != nil {
+			return context.Cause(ctx)
+		}
+		select {
+		case <-c.closed:
+			return ErrClosed
+		default:
+		}
+		c.announcementMut.Lock()
+		_, ready := c.announcedFolders[folder]
+		ready = ready || c.secondaryAnnouncement
+		changed := c.announcementChanged
+		c.announcementMut.Unlock()
+		if ready {
+			return nil
+		}
+		// No connection-wide index slot is held while a new folder waits, so
+		// existing folders and control traffic can continue on this BEP.
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		case <-c.closed:
+			return ErrClosed
+		}
+	}
+}
+
+// Called only by the writer. The latest complete primary snapshot also
+// withdraws paused/removed folders. Secondary changes the connection role;
+// it never claims that any folder has been announced on this connection.
+func (c *rawConnection) recordWrittenAnnouncement(config *ClusterConfig) {
+	folders := make(map[string]struct{}, len(config.Folders))
+	if !config.Secondary {
+		for _, f := range config.Folders {
+			if f.IsRunning() {
+				folders[f.ID] = struct{}{}
+			}
+		}
+	}
+	c.announcementMut.Lock()
+	c.announcedFolders = folders
+	// Both ends independently choose their index-receiving primary. On a
+	// locally secondary connection, the receiving model coordinates indexes
+	// with the full announcement arriving on its other connection.
+	c.secondaryAnnouncement = config.Secondary
+	close(c.announcementChanged)
+	c.announcementChanged = make(chan struct{})
+	c.announcementMut.Unlock()
+}
+
+func (c *rawConnection) indexAnnouncementReady(msg proto.Message) bool {
+	var folder string
+	switch m := msg.(type) {
+	case *bep.Index:
+		folder = m.Folder
+	case *bep.IndexUpdate:
+		folder = m.Folder
+	default:
+		return true
+	}
+	c.announcementMut.Lock()
+	_, ready := c.announcedFolders[folder]
+	ready = ready || c.secondaryAnnouncement
+	c.announcementMut.Unlock()
+	return ready
 }
 
 // Request returns the bytes for the specified block after fetching them from the connected peer.
@@ -547,7 +655,11 @@ func (c *rawConnection) writeClusterConfig(message clusterConfigMessage) (bool, 
 			return false, nil
 		}
 	}
-	return true, c.writeMessage(message.config.toWire())
+	err := c.writeMessage(message.config.toWire())
+	if err == nil {
+		c.recordWrittenAnnouncement(message.config)
+	}
+	return true, err
 }
 
 func (c *rawConnection) Closed() <-chan struct{} {
@@ -586,6 +698,7 @@ func (c *rawConnection) readerLoop() {
 			c.internalClose(err)
 			return
 		}
+		c.logIndexWire("received", msg, time.Time{}, time.Time{}, nil)
 		select {
 		case c.inbox <- msg:
 		case <-c.closed:
@@ -878,16 +991,64 @@ func (c *rawConnection) handleResponse(resp *Response) {
 }
 
 func (c *rawConnection) send(ctx context.Context, msg proto.Message, done chan struct{}) bool {
+	var queued time.Time
+	outbox := c.outbox
+	switch msg.(type) {
+	case *bep.Index, *bep.IndexUpdate:
+		outbox = c.indexBox
+		queued = time.Now()
+		c.logIndexWire("queued", msg, queued, time.Time{}, nil)
+	}
 	select {
-	case c.outbox <- asyncMessage{msg: msg, done: done, ctx: ctx}:
+	case outbox <- asyncMessage{msg: msg, done: done, ctx: ctx, indexQueued: queued}:
 		return true
 	case <-c.closed:
 	case <-ctx.Done():
+	}
+	if !queued.IsZero() {
+		err := context.Cause(ctx)
+		if err == nil {
+			err = ErrClosed
+		}
+		c.logIndexWire("queue_failed", msg, queued, time.Time{}, err)
 	}
 	if done != nil {
 		close(done)
 	}
 	return false
+}
+
+// Index diagnostics never include filenames, block hashes or contents. A write
+// completion is local transport completion, not a remote receipt or DB commit.
+// queued measures waiting to hand off to the index writer lane.
+func (c *rawConnection) logIndexWire(phase string, msg proto.Message, queued, started time.Time, err error) {
+	var folder, kind string
+	var sequence int64
+	var items int
+	switch m := msg.(type) {
+	case *bep.Index:
+		folder, kind, sequence, items = m.Folder, "index", m.LastSequence, len(m.Files)
+	case *bep.IndexUpdate:
+		folder, kind, sequence, items = m.Folder, "index_update", m.LastSequence, len(m.Files)
+	default:
+		return
+	}
+	now := time.Now()
+	connection := ""
+	if c.ConnectionInfo != nil {
+		connection = c.ConnectionID()
+	}
+	args := []any{"phase", phase, "device", c.deviceID.Short(), "connection_id", connection, "folder", folder, "kind", kind, "sequence", sequence, "items", items, "event_time", now.UTC().Format(time.RFC3339Nano)}
+	if !queued.IsZero() {
+		args = append(args, "since_queue", now.Sub(queued), "queued_at", queued.UTC().Format(time.RFC3339Nano))
+	}
+	if !started.IsZero() {
+		args = append(args, "write_elapsed", now.Sub(started))
+	}
+	if err != nil {
+		args = append(args, "error", err.Error())
+	}
+	slog.Info("Index wire", args...)
 }
 
 func (c *rawConnection) writerLoop() {
@@ -912,9 +1073,13 @@ initial:
 		}
 	}
 
+	// One index gets priority after an ordinary message. If both lanes stay
+	// ready they alternate, so neither an index stream nor block responses can
+	// starve the other. Scheduling happens only between complete BEP frames;
+	// it cannot preempt a write or bytes already buffered by the transport.
+	preferIndex := true
 	for {
-		// When the connection is closing or closed, that should happen
-		// immediately, not compete with the (potentially very busy) outbox.
+		// Close and pending announcements retain priority over both lanes.
 		select {
 		case hm := <-c.closeBox:
 			_ = c.writeMessage(hm.msg)
@@ -926,37 +1091,90 @@ initial:
 		}
 		select {
 		case cc := <-c.clusterConfigBox:
-			_, err := c.writeClusterConfig(cc)
-			if err != nil {
+			if _, err := c.writeClusterConfig(cc); err != nil {
 				c.internalClose(err)
 				return
 			}
-		case hm := <-c.outbox:
-			if hm.ctx != nil && hm.ctx.Err() != nil {
-				if response, ok := hm.msg.(*bep.Response); ok {
-					hm.msg = (&Response{ID: int(response.Id), Code: errorToCode(ErrGeneric)}).toWire()
-				} else {
-					if hm.done != nil {
-						close(hm.done)
-					}
-					continue
+			continue
+		default:
+		}
+		preferred := c.outbox
+		if preferIndex {
+			preferred = c.indexBox
+		}
+		var hm asyncMessage
+		selected := false
+		select {
+		case hm = <-preferred:
+			selected = true
+		default:
+		}
+		if !selected {
+			select {
+			case hm = <-c.indexBox:
+			case hm = <-c.outbox:
+			case cc := <-c.clusterConfigBox:
+				if _, err := c.writeClusterConfig(cc); err != nil {
+					c.internalClose(err)
+					return
 				}
-			}
-			err := c.writeMessage(hm.msg)
-			if hm.done != nil {
+				continue
+			case hm := <-c.closeBox:
+				_ = c.writeMessage(hm.msg)
 				close(hm.done)
-			}
-			if err != nil {
-				c.internalClose(err)
+				return
+			case <-c.closed:
 				return
 			}
+		}
+		preferIndex = true
+		switch hm.msg.(type) {
+		case *bep.Index, *bep.IndexUpdate:
+			preferIndex = false
+		}
 
-		case hm := <-c.closeBox:
-			_ = c.writeMessage(hm.msg)
+		if hm.ctx != nil && hm.ctx.Err() != nil {
+			if response, ok := hm.msg.(*bep.Response); ok {
+				hm.msg = (&Response{ID: int(response.Id), Code: errorToCode(ErrGeneric)}).toWire()
+			} else {
+				c.logIndexWire("canceled_before_write", hm.msg, hm.indexQueued, time.Time{}, context.Cause(hm.ctx))
+				if hm.written != nil {
+					hm.written <- context.Cause(hm.ctx)
+				}
+				if hm.done != nil {
+					close(hm.done)
+				}
+				continue
+			}
+		}
+		// Recheck in wire order: a pause/withdrawal may have been written
+		// after the sender observed readiness but before this handoff.
+		if hm.written != nil && c.folderAdmit != nil && !c.indexAnnouncementReady(hm.msg) {
+			c.logIndexWire("announcement_deferred", hm.msg, hm.indexQueued, time.Time{}, errIndexAnnouncementPending)
+			hm.written <- errIndexAnnouncementPending
+			continue
+		}
+		var started time.Time
+		if !hm.indexQueued.IsZero() {
+			started = time.Now()
+			c.logIndexWire("write_started", hm.msg, hm.indexQueued, time.Time{}, nil)
+		}
+		err := c.writeMessage(hm.msg)
+		if !hm.indexQueued.IsZero() {
+			phase := "write_completed"
+			if err != nil {
+				phase = "write_failed"
+			}
+			c.logIndexWire(phase, hm.msg, hm.indexQueued, started, err)
+		}
+		if hm.written != nil {
+			hm.written <- err
+		}
+		if hm.done != nil {
 			close(hm.done)
-			return
-
-		case <-c.closed:
+		}
+		if err != nil {
+			c.internalClose(err)
 			return
 		}
 	}

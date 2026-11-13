@@ -10,11 +10,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	lz4 "github.com/pierrec/lz4/v4"
@@ -643,12 +647,13 @@ func TestConcurrentStartAndClose(t *testing.T) {
 func TestFolderCancellationSkipsQueuedBytesAndPreservesControl(t *testing.T) {
 	var output bytes.Buffer
 	c := newRawConnection(c0ID, bytes.NewReader(nil), &output, testutil.NoopCloser{}, nil, new(mockedConnectionInfo), CompressionNever)
-	c.outbox = make(chan asyncMessage, 3)
+	c.outbox = make(chan asyncMessage, 2)
+	c.indexBox = make(chan asyncMessage, 1)
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
 	responseDone, indexDone, pingDone := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	c.outbox <- asyncMessage{ctx: canceled, msg: (&Response{ID: 7, Data: []byte("revoked data")}).toWire(), done: responseDone}
-	c.outbox <- asyncMessage{ctx: canceled, msg: (&Index{Folder: "revoked"}).toWire(), done: indexDone}
+	c.indexBox <- asyncMessage{ctx: canceled, msg: (&Index{Folder: "revoked"}).toWire(), done: indexDone}
 	c.outbox <- asyncMessage{msg: &bep.Ping{}, done: pingDone}
 	exited := make(chan struct{})
 	go func() { defer close(exited); c.writerLoop() }()
@@ -702,7 +707,7 @@ func TestFolderIndexBorrowEndsAfterActualWrite(t *testing.T) {
 	exited := make(chan struct{})
 	go func() { defer close(exited); c.writerLoop() }()
 	ccDone := make(chan struct{})
-	c.clusterConfigBox <- clusterConfigMessage{config: &ClusterConfig{}, done: ccDone}
+	c.clusterConfigBox <- clusterConfigMessage{config: &ClusterConfig{Folders: []Folder{{ID: "one"}}}, done: ccDone}
 	<-ccDone
 	// No write is active between the initial config and Index submission.
 	writer := heldFolderWriter{make(chan struct{}, 1), make(chan struct{})}
@@ -745,7 +750,7 @@ func TestFolderIndexCancellationDoesNotWaitForOtherFolderWrite(t *testing.T) {
 				exited := make(chan struct{})
 				go func() { defer close(exited); c.writerLoop() }()
 				ccDone := make(chan struct{})
-				c.clusterConfigBox <- clusterConfigMessage{config: &ClusterConfig{}, done: ccDone}
+				c.clusterConfigBox <- clusterConfigMessage{config: &ClusterConfig{Folders: []Folder{{ID: "A"}, {ID: "B"}, {ID: "C"}}}, done: ccDone}
 				<-ccDone
 				writer := heldFolderWriter{make(chan struct{}, 1), make(chan struct{})}
 				c.cw = &countingWriter{Writer: writer}
@@ -1246,5 +1251,680 @@ func TestRequestCancelResponseCloseRace(t *testing.T) {
 		if n != 0 {
 			t.Fatalf("awaiting after race: %d", n)
 		}
+	}
+}
+
+// Acceptance into the writer is not proof that bytes were written. Cancellation
+// before write must be distinguishable from cancellation during a full write.
+func TestFolderIndexWriteOutcome(t *testing.T) {
+	for _, update := range []bool{false, true} {
+		for _, mode := range []string{"skipped", "written", "failed"} {
+			t.Run(fmt.Sprintf("update=%v/%s", update, mode), func(t *testing.T) {
+				c := getRawConnection(NewConnection(c0ID, bytes.NewReader(nil), io.Discard, testutil.NoopCloser{}, newTestModel(), new(mockedConnectionInfo), CompressionNever, testKeyGen))
+				scope, cancel := context.WithCancelCause(context.Background())
+				defer cancel(nil)
+				released := make(chan struct{})
+				c.folderAdmit = func(context.Context, string) (context.Context, func(), error) {
+					return scope, func() { close(released) }, nil
+				}
+				c.recordWrittenAnnouncement(&ClusterConfig{Folders: []Folder{{ID: "folder"}}})
+				result := make(chan error, 1)
+				indexDone := make(chan struct{})
+				go func() {
+					defer close(indexDone)
+					if update {
+						result <- c.IndexUpdate(context.Background(), &IndexUpdate{Folder: "folder"})
+					} else {
+						result <- c.Index(context.Background(), &Index{Folder: "folder"})
+					}
+				}()
+				// Intercept the unbuffered handoff to deterministically order cancellation
+				// before the writer examines this exact queued message.
+				msg := <-c.indexBox
+				if mode == "skipped" {
+					cancel(ErrFolderAccessClosed)
+				}
+				exited := make(chan struct{})
+				go func() { defer close(exited); c.writerLoop() }()
+				ccDone := make(chan struct{})
+				c.clusterConfigBox <- clusterConfigMessage{config: &ClusterConfig{Folders: []Folder{{ID: "folder"}}}, done: ccDone}
+				<-ccDone
+				writer := &indexOutcomeWriter{entered: make(chan struct{}), resume: make(chan struct{}), fail: mode == "failed"}
+				c.cw = &countingWriter{Writer: writer}
+				var resumeOnce sync.Once
+				resume := func() { resumeOnce.Do(func() { close(writer.resume) }) }
+				defer func() { cancel(nil); resume(); c.internalClose(errManual); <-exited; <-indexDone }()
+				c.indexBox <- msg
+				if mode != "skipped" {
+					<-writer.entered
+					cancel(ErrFolderAccessClosed)
+					select {
+					case <-released:
+						t.Fatal("released before actual write completion")
+					default:
+					}
+					resume()
+				}
+				err := <-result
+				switch mode {
+				case "skipped":
+					if !errors.Is(err, ErrFolderAccessClosed) {
+						t.Fatalf("skipped: %v", err)
+					}
+				case "written":
+					if err != nil {
+						t.Fatalf("complete write misreported as cancellation: %v", err)
+					}
+				case "failed":
+					if !errors.Is(err, io.ErrClosedPipe) {
+						t.Fatalf("write error lost: %v", err)
+					}
+				}
+				<-released
+				if mode == "failed" {
+					<-c.Closed()
+				} else {
+					c.internalClose(errManual)
+				}
+				<-exited
+			})
+		}
+	}
+}
+
+type indexOutcomeWriter struct {
+	entered, resume chan struct{}
+	once            sync.Once
+	fail            bool
+}
+
+func (w *indexOutcomeWriter) Write(p []byte) (int, error) {
+	w.once.Do(func() { close(w.entered) })
+	<-w.resume
+	if w.fail {
+		return 0, io.ErrClosedPipe
+	}
+	return len(p), nil
+}
+
+// A reopened data fence is not evidence that the peer has received our new
+// folder announcement. Exercise the real writer's ordering on an existing BEP.
+func TestFolderIndexWaitsForWrittenAnnouncement(t *testing.T) {
+	for _, update := range []bool{false, true} {
+		t.Run(fmt.Sprint(update), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var output bytes.Buffer
+				c := newRawConnection(c0ID, bytes.NewReader(nil), &output, testutil.NoopCloser{}, nil, new(mockedConnectionInfo), CompressionNever)
+				c.folderAdmit = func(ctx context.Context, _ string) (context.Context, func(), error) { return ctx, func() {}, nil }
+				exited := make(chan struct{})
+				go func() { defer close(exited); c.writerLoop() }()
+				defer func() { close(c.closed); <-exited }()
+				c.ClusterConfig(&ClusterConfig{Folders: []Folder{{ID: "existing"}}}, nil)
+				done := make(chan error, 1)
+				go func() {
+					if update {
+						done <- c.IndexUpdate(context.Background(), &IndexUpdate{Folder: "reverse"})
+					} else {
+						done <- c.Index(context.Background(), &Index{Folder: "reverse"})
+					}
+				}()
+				synctest.Wait()
+				select {
+				case err := <-done:
+					t.Fatalf("index passed its withheld announcement: %v", err)
+				default:
+				}
+				if err := c.Index(context.Background(), &Index{Folder: "existing"}); err != nil {
+					t.Fatal(err)
+				}
+				c.ClusterConfig(&ClusterConfig{Folders: []Folder{{ID: "existing"}, {ID: "reverse"}}}, nil)
+				if err := <-done; err != nil {
+					t.Fatal(err)
+				}
+				reader := newRawConnection(c1ID, bytes.NewReader(output.Bytes()), io.Discard, testutil.NoopCloser{}, nil, new(mockedConnectionInfo), CompressionNever)
+				for i := 0; i < 4; i++ {
+					msg, err := reader.readMessage(make([]byte, 4))
+					if err != nil {
+						t.Fatal(err)
+					}
+					if i == 2 {
+						if cc, ok := msg.(*bep.ClusterConfig); !ok || len(cc.Folders) != 2 {
+							t.Fatalf("announcement must precede new index: %T", msg)
+						}
+					}
+					if i == 3 {
+						switch m := msg.(type) {
+						case *bep.Index:
+							if m.Folder != "reverse" {
+								t.Fatal(m)
+							}
+						case *bep.IndexUpdate:
+							if m.Folder != "reverse" {
+								t.Fatal(m)
+							}
+						default:
+							t.Fatalf("last message: %T", msg)
+						}
+					}
+				}
+			})
+		})
+	}
+}
+
+func TestFolderIndexAnnouncementWaitCancellationAndWithdrawal(t *testing.T) {
+	for _, mode := range []string{"cancel", "close", "withdraw", "pause", "canceled-announcement", "failed-announcement"} {
+		t.Run(mode, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				c := newRawConnection(c0ID, bytes.NewReader(nil), io.Discard, testutil.NoopCloser{}, nil, new(mockedConnectionInfo), CompressionNever)
+				c.folderAdmit = func(ctx context.Context, _ string) (context.Context, func(), error) { return ctx, func() {}, nil }
+				exited := make(chan struct{})
+				go func() { defer close(exited); c.writerLoop() }()
+				var once sync.Once
+				shutdown := func() { once.Do(func() { close(c.closed) }) }
+				defer func() { shutdown(); <-exited }()
+				cc := &ClusterConfig{Folders: []Folder{{ID: "existing"}, {ID: "reverse"}}}
+				if mode == "withdraw" || mode == "pause" {
+					c.ClusterConfig(cc, nil)
+					c.idxGate <- struct{}{} // Let the sender observe readiness, but delay its handoff.
+				} else {
+					c.ClusterConfig(&ClusterConfig{Folders: []Folder{{ID: "existing"}}}, nil)
+				}
+				ctx, cancel := context.WithCancelCause(context.Background())
+				defer cancel(nil)
+				done := make(chan error, 1)
+				go func() { done <- c.Index(ctx, &Index{Folder: "reverse"}) }()
+				synctest.Wait()
+				if mode == "withdraw" || mode == "pause" {
+					next := &ClusterConfig{Folders: []Folder{{ID: "existing"}}}
+					if mode == "pause" {
+						next.Folders = append(next.Folders, Folder{ID: "reverse", StopReason: FolderStopReasonPaused})
+					}
+					c.ClusterConfig(next, nil)
+					<-c.idxGate
+				}
+				if mode == "canceled-announcement" || mode == "failed-announcement" {
+					scoped, abort := context.WithCancel(context.Background())
+					abort()
+					message := clusterConfigMessage{config: cc, scopes: []context.Context{scoped}, done: make(chan struct{})}
+					if mode == "failed-announcement" {
+						message.scopes = nil
+						c.cw = &countingWriter{Writer: announcementErrorWriter{}}
+					}
+					// No writer operation is active: test the exact completion helper.
+					_, err := c.writeClusterConfig(message)
+					if mode == "failed-announcement" {
+						if !errors.Is(err, io.ErrClosedPipe) {
+							t.Fatal(err)
+						}
+						c.cw = &countingWriter{Writer: io.Discard}
+					}
+				}
+				synctest.Wait()
+				select {
+				case err := <-done:
+					t.Fatalf("index passed missing/withdrawn announcement: %v", err)
+				default:
+				}
+				if err := c.Index(context.Background(), &Index{Folder: "existing"}); err != nil {
+					t.Fatal(err)
+				}
+				if mode == "close" {
+					shutdown()
+					if err := <-done; !errors.Is(err, ErrClosed) {
+						t.Fatal(err)
+					}
+				} else if mode == "cancel" {
+					cancel(ErrFolderAccessClosed)
+					if err := <-done; !errors.Is(err, ErrFolderAccessClosed) {
+						t.Fatal(err)
+					}
+				} else {
+					c.ClusterConfig(cc, nil)
+					if err := <-done; err != nil {
+						t.Fatal(err)
+					}
+				}
+			})
+		})
+	}
+}
+
+type announcementErrorWriter struct{}
+
+func (announcementErrorWriter) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }
+
+func TestFolderIndexSecondaryPromotionRestoresAnnouncementGate(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := newRawConnection(c0ID, bytes.NewReader(nil), io.Discard, testutil.NoopCloser{}, nil, new(mockedConnectionInfo), CompressionNever)
+		c.folderAdmit = func(ctx context.Context, _ string) (context.Context, func(), error) { return ctx, func() {}, nil }
+		exited := make(chan struct{})
+		go func() { defer close(exited); c.writerLoop() }()
+		defer func() { close(c.closed); <-exited }()
+		c.ClusterConfig(&ClusterConfig{Secondary: true}, nil)
+		if err := c.Index(context.Background(), &Index{Folder: "reverse"}); err != nil {
+			t.Fatal(err)
+		}
+		// Promotion makes this connection responsible for the complete metadata.
+		c.ClusterConfig(&ClusterConfig{Folders: []Folder{{ID: "existing"}}}, nil)
+		done := make(chan error, 1)
+		go func() { done <- c.Index(context.Background(), &Index{Folder: "reverse"}) }()
+		synctest.Wait()
+		select {
+		case err := <-done:
+			t.Fatalf("secondary readiness survived promotion: %v", err)
+		default:
+		}
+		c.ClusterConfig(&ClusterConfig{Folders: []Folder{{ID: "existing"}, {ID: "reverse"}}}, nil)
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+// Observe real IndexUpdate -> index lane -> writer boundaries, holding each stage
+// independently. Virtual time measures queue and write delays without sleeps
+// depending on scheduler speed or network performance.
+func TestIndexWireDiagnostics(t *testing.T) {
+	for _, mode := range []string{"written", "failed", "queue_canceled", "canceled_before_write"} {
+		t.Run(mode, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var output indexTraceBuffer
+				old := slog.Default()
+				slog.SetDefault(slog.New(slog.NewJSONHandler(&output, nil)))
+				defer slog.SetDefault(old)
+				info := new(mockedConnectionInfo)
+				info.ConnectionIDReturns("diagnostic-connection")
+				c := getRawConnection(NewConnection(c0ID, bytes.NewReader(nil), io.Discard, testutil.NoopCloser{}, newTestModel(), info, CompressionNever, testKeyGen))
+				ctx, cancel := context.WithCancelCause(context.Background())
+				defer cancel(nil)
+				c.folderAdmit = func(context.Context, string) (context.Context, func(), error) { return ctx, func() {}, nil }
+				c.recordWrittenAnnouncement(&ClusterConfig{Folders: []Folder{{ID: "folder"}}})
+				result := make(chan error, 1)
+				go func() {
+					result <- c.IndexUpdate(context.Background(), &IndexUpdate{Folder: "folder", LastSequence: 17, Files: []FileInfo{{Name: "never-log-filename"}}})
+				}()
+				synctest.Wait()
+				first := output.events(t)
+				if len(first) != 1 || first[0]["phase"] != "queued" {
+					t.Fatalf("missing queued boundary: %v", first)
+				}
+				time.Sleep(3 * time.Second)
+				if mode == "queue_canceled" {
+					cancel(ErrFolderAccessClosed)
+					if err := <-result; !errors.Is(err, ErrFolderAccessClosed) {
+						t.Fatal(err)
+					}
+					events := output.events(t)
+					if len(events) != 2 || events[1]["phase"] != "queue_failed" || events[1]["since_queue"] != float64(3*time.Second) {
+						t.Fatal(events)
+					}
+					c.internalClose(errManual)
+					return
+				}
+				msg := <-c.indexBox
+				if mode == "canceled_before_write" {
+					cancel(ErrFolderAccessClosed)
+				}
+				exited := make(chan struct{})
+				go func() { defer close(exited); c.writerLoop() }()
+				ccDone := make(chan struct{})
+				c.clusterConfigBox <- clusterConfigMessage{config: &ClusterConfig{Folders: []Folder{{ID: "folder"}}}, done: ccDone}
+				<-ccDone
+				writer := &indexOutcomeWriter{entered: make(chan struct{}), resume: make(chan struct{}), fail: mode == "failed"}
+				c.cw = &countingWriter{Writer: writer}
+				var once sync.Once
+				resume := func() { once.Do(func() { close(writer.resume) }) }
+				defer func() { resume(); c.internalClose(errManual); <-exited }()
+				c.indexBox <- msg
+				if mode != "canceled_before_write" {
+					<-writer.entered
+					events := output.events(t)
+					if len(events) != 2 || events[1]["phase"] != "write_started" || events[1]["since_queue"] != float64(3*time.Second) {
+						t.Fatal(events)
+					}
+					time.Sleep(2 * time.Second)
+					resume()
+				}
+				err := <-result
+				if (mode == "written") != (err == nil) {
+					t.Fatalf("outcome %s: %v", mode, err)
+				}
+				events := output.events(t)
+				phase := "write_completed"
+				if mode == "failed" {
+					phase = "write_failed"
+				}
+				if mode == "canceled_before_write" {
+					phase = "canceled_before_write"
+				}
+				last := events[len(events)-1]
+				if last["phase"] != phase {
+					t.Fatal(events)
+				}
+				if mode != "canceled_before_write" && (last["since_queue"] != float64(5*time.Second) || last["write_elapsed"] != float64(2*time.Second)) {
+					t.Fatal(last)
+				}
+				for _, ev := range events {
+					if ev["folder"] != "folder" || ev["sequence"] != float64(17) || ev["items"] != float64(1) || ev["connection_id"] != "diagnostic-connection" {
+						t.Fatal(ev)
+					}
+					if _, err := time.Parse(time.RFC3339Nano, ev["event_time"].(string)); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if strings.Contains(output.text(), "never-log-filename") {
+					t.Fatal("index payload leaked")
+				}
+			})
+		})
+	}
+}
+
+type indexTraceBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *indexTraceBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+func (b *indexTraceBuffer) text() string { b.mu.Lock(); defer b.mu.Unlock(); return b.buf.String() }
+func (b *indexTraceBuffer) events(t *testing.T) []map[string]any {
+	t.Helper()
+	var result []map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(b.text()), "\n") {
+		var ev map[string]any
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatal(err)
+		}
+		if ev["msg"] == "Index wire" {
+			result = append(result, ev)
+		}
+	}
+	return result
+}
+
+// steppedProtocolWriter holds each complete frame until the test releases it.
+// Both producers can reach their real unbuffered handoff before the next choice.
+type steppedProtocolWriter struct {
+	frames chan []byte
+	resume chan error
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (w *steppedProtocolWriter) Write(p []byte) (int, error) {
+	select {
+	case w.frames <- append([]byte(nil), p...):
+	case <-w.closed:
+		return 0, io.ErrClosedPipe
+	}
+	select {
+	case err := <-w.resume:
+		if err != nil {
+			return 0, err
+		}
+		return len(p), nil
+	case <-w.closed:
+		return 0, io.ErrClosedPipe
+	}
+}
+func (w *steppedProtocolWriter) Close() error {
+	w.once.Do(func() { close(w.closed) })
+	return nil
+}
+func (w *steppedProtocolWriter) next(t *testing.T) proto.Message {
+	t.Helper()
+	synctest.Wait()
+	select {
+	case frame := <-w.frames:
+		reader := newRawConnection(c1ID, bytes.NewReader(frame), io.Discard, testutil.NoopCloser{}, nil, new(mockedConnectionInfo), CompressionNever)
+		msg, err := reader.readMessage(make([]byte, 4))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return msg
+	default:
+		t.Fatal("writer did not produce the next frame")
+		return nil
+	}
+}
+func newSteppedProtocolConnection(t *testing.T, admitted bool) (*rawConnection, *steppedProtocolWriter) {
+	t.Helper()
+	w := &steppedProtocolWriter{frames: make(chan []byte), resume: make(chan error), closed: make(chan struct{})}
+	c := getRawConnection(NewConnection(c0ID, bytes.NewReader(nil), w, w, newTestModel(), new(mockedConnectionInfo), CompressionNever, testKeyGen))
+	if admitted {
+		c.folderAdmit = func(ctx context.Context, _ string) (context.Context, func(), error) { return ctx, func() {}, nil }
+	}
+	exited := make(chan struct{})
+	go func() { defer close(exited); c.writerLoop() }()
+	t.Cleanup(func() { c.internalClose(errManual); <-exited })
+	ccDone := make(chan struct{})
+	c.clusterConfigBox <- clusterConfigMessage{config: &ClusterConfig{Folders: []Folder{{ID: "folder"}}}, done: ccDone}
+	if _, ok := w.next(t).(*bep.ClusterConfig); !ok {
+		t.Fatal("missing initial configuration")
+	}
+	w.resume <- nil
+	<-ccDone
+	return c, w
+}
+
+func TestWriterIndexPriorityAndFairData(t *testing.T) {
+	for _, admitted := range []bool{false, true} {
+		for _, counts := range [][2]int{{8, 8}, {8, 0}, {0, 8}} {
+			t.Run(fmt.Sprintf("admitted=%v/data=%d/index=%d", admitted, counts[0], counts[1]), func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					c, w := newSteppedProtocolConnection(t, admitted)
+					var workers sync.WaitGroup
+					defer func() { c.internalClose(errManual); workers.Wait() }()
+					data := bytes.Repeat([]byte{0xab}, 64<<10)
+					workers.Add(1)
+					go func() {
+						defer workers.Done()
+
+						done := make(chan struct{})
+						c.send(context.Background(), (&Response{ID: 0, Data: data}).toWire(), done)
+						<-done
+					}()
+					if msg, ok := w.next(t).(*bep.Response); !ok || msg.Id != 0 {
+						t.Fatal("missing leading block", msg)
+					}
+					// Queue bulk data first, then the new index while the first
+					// block is in flight. FIFO sharing would put data ahead of it.
+					workers.Add(1)
+					go func() {
+						defer workers.Done()
+
+						for i := 1; i <= counts[0]; i++ {
+							done := make(chan struct{})
+							if !c.send(context.Background(), (&Response{ID: i, Data: data}).toWire(), done) {
+								return
+							}
+							<-done
+						}
+					}()
+					synctest.Wait()
+					indexResult := make(chan error, 1)
+					workers.Add(1)
+					go func() {
+						defer workers.Done()
+
+						for i := 1; i <= counts[1]; i++ {
+							var err error
+							if i == 1 {
+								err = c.Index(context.Background(), &Index{Folder: "folder", LastSequence: int64(i)})
+							} else {
+								err = c.IndexUpdate(context.Background(), &IndexUpdate{Folder: "folder", LastSequence: int64(i)})
+							}
+							if err != nil {
+								indexResult <- err
+								return
+							}
+						}
+						indexResult <- nil
+					}()
+					synctest.Wait()
+					w.resume <- nil
+					for i := 1; i <= max(counts[0], counts[1]); i++ {
+						if i <= counts[1] {
+							msg := w.next(t)
+							var sequence int64
+							switch m := msg.(type) {
+							case *bep.Index:
+								sequence = m.LastSequence
+							case *bep.IndexUpdate:
+								sequence = m.LastSequence
+							default:
+								t.Fatalf("index %d delayed behind %T", i, msg)
+							}
+							if sequence != int64(i) {
+								t.Fatal("index reordered", sequence, i)
+							}
+							w.resume <- nil
+						}
+						if i <= counts[0] {
+							msg, ok := w.next(t).(*bep.Response)
+							if !ok || msg.Id != int32(i) || !bytes.Equal(msg.Data, data) {
+								t.Fatal("data starved, reordered or corrupted", i)
+							}
+							w.resume <- nil
+						}
+					}
+					if err := <-indexResult; err != nil {
+						t.Fatal(err)
+					}
+					workers.Wait()
+				})
+			})
+		}
+	}
+}
+
+func TestWriterPriorityKeepsAnnouncementAndCancellation(t *testing.T) {
+	for _, mode := range []string{"withdraw", "cancel", "close", "write_failure"} {
+		t.Run(mode, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				c, w := newSteppedProtocolConnection(t, true)
+				var workers sync.WaitGroup
+				defer func() { c.internalClose(errManual); workers.Wait() }()
+				ctx, cancel := context.WithCancelCause(context.Background())
+				defer cancel(nil)
+				workers.Add(1)
+				go func() {
+					defer workers.Done()
+
+					done := make(chan struct{})
+					c.send(context.Background(), (&Response{ID: 1}).toWire(), done)
+					<-done
+				}()
+				if _, ok := w.next(t).(*bep.Response); !ok {
+					t.Fatal("missing in-flight data")
+				}
+				result := make(chan error, 1)
+				workers.Add(1)
+				go func() {
+					defer workers.Done()
+					result <- c.IndexUpdate(ctx, &IndexUpdate{Folder: "folder", LastSequence: 7})
+				}()
+				workers.Add(1)
+				go func() {
+					defer workers.Done()
+
+					done := make(chan struct{})
+					c.send(context.Background(), (&Response{ID: 2}).toWire(), done)
+					<-done
+				}()
+				synctest.Wait()
+				switch mode {
+				case "withdraw":
+					workers.Add(1)
+					go func() {
+						defer workers.Done()
+
+						c.ClusterConfig(&ClusterConfig{Folders: []Folder{{ID: "folder", StopReason: FolderStopReasonPaused}}}, nil)
+					}()
+				case "cancel":
+					cancel(ErrFolderAccessClosed)
+					if err := <-result; !errors.Is(err, ErrFolderAccessClosed) {
+						t.Fatal(err)
+					}
+				case "close":
+					workers.Add(1)
+					go func() {
+						defer workers.Done()
+
+						done := make(chan struct{})
+						select {
+						case c.closeBox <- asyncMessage{msg: &bep.Close{Reason: "test"}, done: done}:
+							<-done
+						case <-c.closed:
+						}
+					}()
+				}
+				synctest.Wait()
+				w.resume <- nil
+				switch mode {
+				case "withdraw":
+					if _, ok := w.next(t).(*bep.ClusterConfig); !ok {
+						t.Fatal("withdrawal was overtaken")
+					}
+					w.resume <- nil
+					if m, ok := w.next(t).(*bep.Response); !ok || m.Id != 2 {
+						t.Fatal("withdrawn index was written or data blocked")
+					}
+					synctest.Wait()
+					select {
+					case err := <-result:
+						t.Fatal("withdrawn index completed", err)
+					default:
+					}
+					workers.Add(1)
+					go func() {
+						defer workers.Done()
+						c.ClusterConfig(&ClusterConfig{Folders: []Folder{{ID: "folder"}}}, nil)
+					}()
+					synctest.Wait()
+					w.resume <- nil
+					if _, ok := w.next(t).(*bep.ClusterConfig); !ok {
+						t.Fatal("missing resume announcement")
+					}
+					w.resume <- nil
+					if m, ok := w.next(t).(*bep.IndexUpdate); !ok || m.LastSequence != 7 {
+						t.Fatal("index did not resume")
+					}
+					w.resume <- nil
+					if err := <-result; err != nil {
+						t.Fatal(err)
+					}
+				case "cancel":
+					if m, ok := w.next(t).(*bep.Response); !ok || m.Id != 2 {
+						t.Fatal("canceled index wrote bytes")
+					}
+					w.resume <- nil
+				case "close":
+					if _, ok := w.next(t).(*bep.Close); !ok {
+						t.Fatal("close lost priority")
+					}
+					w.resume <- nil
+					c.internalClose(errManual)
+					if err := <-result; !errors.Is(err, ErrClosed) {
+						t.Fatal(err)
+					}
+				case "write_failure":
+					if _, ok := w.next(t).(*bep.IndexUpdate); !ok {
+						t.Fatal("index lost priority")
+					}
+					w.resume <- io.ErrClosedPipe
+					if err := <-result; !errors.Is(err, io.ErrClosedPipe) {
+						t.Fatal("write error lost", err)
+					}
+					<-c.closed
+				}
+				workers.Wait()
+			})
+		})
 	}
 }

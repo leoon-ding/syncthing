@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/url"
@@ -62,6 +63,7 @@ func (c *staticClient) serve(ctx context.Context) error {
 func (c *staticClient) serveWithRenewal(ctx context.Context, renew <-chan time.Time) error {
 	if err := c.connect(ctx); err != nil {
 		l.Debugf("Could not connect to relay %s: %s", c.uri, err)
+		c.logPrivateSetupFailure(ctx, "connect", err)
 		return err
 	}
 
@@ -79,6 +81,7 @@ func (c *staticClient) serveWithRenewal(ctx context.Context, renew <-chan time.T
 	expires, err := c.join(ctx)
 	if err != nil {
 		l.Debugf("Could not join relay %s: %s", c.uri, err)
+		c.logPrivateSetupFailure(ctx, "join", err)
 		return err
 	}
 
@@ -344,8 +347,11 @@ func messageReader(ctx context.Context, conn net.Conn, messages chan<- any, erro
 	}
 }
 
-// The issuer callback supplies the token. Its expiry is only a scheduling hint;
-// authenticity, identity and permission are still verified by the relay.
+// The issuer callback supplies the token. Its timestamps use the issuer's clock,
+// so a future issued-at is not a client-side permission failure. Bound the local
+// scheduling hint by both the absolute expiry and the signed lifetime; never add
+// clock skew to that lifetime. The relay still verifies authenticity, identity
+// and validity using its own clock.
 func privatePermitExpiry(token protocol.PermitToken, now time.Time) (time.Time, error) {
 	if len(token) > 4096 {
 		return time.Time{}, protocol.ErrPermit
@@ -359,10 +365,34 @@ func privatePermitExpiry(token protocol.PermitToken, now time.Time) (time.Time, 
 		return time.Time{}, protocol.ErrPermit
 	}
 	var permit protocol.Permit
-	if json.Unmarshal(raw, &permit) != nil || permit.Purpose != "join" || permit.IssuedAt <= 0 || permit.IssuedAt > now.Unix() || permit.ExpiresAt <= now.Unix() || permit.ExpiresAt <= permit.IssuedAt || permit.ExpiresAt-permit.IssuedAt > 300 {
+	if json.Unmarshal(raw, &permit) != nil || permit.Purpose != "join" || permit.IssuedAt <= 0 || permit.ExpiresAt <= now.Unix() || permit.ExpiresAt <= permit.IssuedAt || permit.ExpiresAt-permit.IssuedAt > 300 {
 		return time.Time{}, protocol.ErrPermit
 	}
-	return time.Unix(permit.ExpiresAt, 0), nil
+	lifetime := time.Duration(permit.ExpiresAt-permit.IssuedAt) * time.Second
+	remaining := min(time.Unix(permit.ExpiresAt, 0).Sub(now), lifetime)
+	return now.Add(remaining), nil
+}
+
+// Private setup failures must be visible without logging the signed permit,
+// endpoint, certificate identities or untrusted server response text.
+func (c *staticClient) logPrivateSetupFailure(ctx context.Context, stage string, err error) {
+	if c.permit == nil || ctx.Err() != nil {
+		return
+	}
+	reason := "transport_or_protocol"
+	var response *incorrectResponseCodeErr
+	var network net.Error
+	switch {
+	case errors.Is(err, protocol.ErrPermit):
+		reason = "permit_invalid"
+	case errors.As(err, &response):
+		reason = "relay_rejected"
+	case errors.Is(err, context.DeadlineExceeded), errors.As(err, &network) && network.Timeout():
+		reason = "timeout"
+	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF), errors.Is(err, net.ErrClosed):
+		reason = "connection_closed"
+	}
+	slog.WarnContext(ctx, "Private relay setup failed", "stage", stage, "reason", reason)
 }
 
 func permitRenewalDelay(expires, now time.Time) (time.Duration, error) {

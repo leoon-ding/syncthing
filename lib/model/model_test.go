@@ -24,6 +24,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/syncthing/syncthing/internal/db"
@@ -4404,6 +4405,203 @@ func TestFolderReopenRegeneratesClusterConfig(t *testing.T) {
 	}
 }
 
+func TestNewFolderClusterConfigDeferredUntilReopen(t *testing.T) {
+	for _, action := range []string{"index", "notification", "before-commit", "before-share", "withdraw", "unshare", "remote-pause", "replace-connection"} {
+		t.Run(action, func(t *testing.T) {
+			cfg, _ := newDefaultCfgWrapper(t)
+			gate := new(FolderAccess)
+			m := setupModel(t, cfg, gate)
+			defer cleanupModel(m)
+			conn := newFakeConnection(device1, m)
+			m.AddConnection(conn, protocol.Hello{})
+			announcement := func(reverse bool, indexID protocol.IndexID, paused bool) *protocol.ClusterConfig {
+				folders := []protocol.Folder{{ID: "default", Devices: []protocol.Device{{ID: myID}, {ID: device1}}}}
+				if reverse {
+					f := protocol.Folder{ID: "reverse", Devices: []protocol.Device{{ID: myID}, {ID: device1, IndexID: indexID}}}
+					if paused {
+						f.StopReason = protocol.FolderStopReasonPaused
+					}
+					folders = append(folders, f)
+				}
+				return &protocol.ClusterConfig{Folders: folders}
+			}
+			must(t, m.ClusterConfig(conn, announcement(false, 0, false)))
+			gate.Seal(device1, "reverse")
+			folder := newFolderConfig()
+			folder.ID = "reverse"
+			install := func(shared bool) {
+				f := folder
+				if !shared {
+					f.Devices = nil
+				}
+				w, err := cfg.Modify(func(c *config.Configuration) { c.SetFolder(f) })
+				must(t, err)
+				w.Wait()
+				must(t, m.ScanFolder("reverse"))
+			}
+			if action != "before-commit" {
+				install(action != "before-share")
+			}
+			must(t, m.ClusterConfig(conn, announcement(true, 101, false)))
+			// The latest announcement supersedes the old one even while fenced.
+			must(t, m.ClusterConfig(conn, announcement(true, 102, action == "remote-pause")))
+			registry := m.ensureIndexHandler(conn)
+			if _, ok := registry.indexHandlers.Get("reverse"); ok {
+				t.Fatal("fenced announcement started a handler")
+			}
+			if action == "withdraw" {
+				must(t, m.ClusterConfig(conn, announcement(false, 0, false)))
+			}
+			if action == "unshare" {
+				w, err := cfg.Modify(func(c *config.Configuration) {
+					f := c.FolderMap()["reverse"]
+					f.Devices = nil
+					c.SetFolder(f)
+				})
+				must(t, err)
+				w.Wait()
+			}
+			if action == "replace-connection" {
+				conn.Close(errors.New("replace fenced connection"))
+				conn = newFakeConnection(device1, m)
+				m.AddConnection(conn, protocol.Hello{})
+				must(t, m.ClusterConfig(conn, announcement(false, 0, false)))
+			}
+			// A sibling with no delta index ID must not be replayed/reset when
+			// the new folder opens. Persist a file after the final announcement.
+			must(t, m.Index(conn, &protocol.Index{Folder: "default", Files: []protocol.FileInfo{{Name: "keep", Sequence: 1, Deleted: true, Version: protocol.Vector{}.Update(device1.Short())}}}))
+			if action == "before-commit" || action == "before-share" {
+				// The sibling's Index above must not discard negotiation while
+				// the new folder/share is still fenced and not yet committed.
+				install(true)
+			}
+			current := m.ensureIndexHandler(conn)
+			existing, _ := current.indexHandlers.Get("default")
+			if action == "index" {
+				// Model the interval after Open has committed but before the
+				// model loop consumes its notification, deterministically.
+				gate.mu.Lock()
+				delete(gate.sealed, folderScope{device1, "reverse"})
+				gate.mu.Unlock()
+			} else {
+				must(t, gate.Open(device1, "reverse"))
+				// Take the same completion boundary as the notification handler;
+				// no scheduling delay or peer retransmission is needed.
+				m.retryPendingClusterConfigs()
+			}
+			err := m.Index(conn, &protocol.Index{Folder: "reverse", Files: []protocol.FileInfo{{Name: "first", Sequence: 1, Deleted: true, Version: protocol.Vector{}.Update(device1.Short())}}})
+			if action == "index" || action == "notification" || action == "before-commit" || action == "before-share" {
+				must(t, err)
+				must(t, m.IndexUpdate(conn, &protocol.IndexUpdate{Folder: "reverse", PrevSequence: 1, LastSequence: 2, Files: []protocol.FileInfo{{Name: "second", Sequence: 2, Deleted: true, Version: protocol.Vector{}.Update(device1.Short())}}}))
+				id, err := m.sdb.GetIndexID("reverse", device1)
+				must(t, err)
+				if id != 102 {
+					t.Fatal("replayed stale remote index ID", id)
+				}
+				seq, err := m.sdb.GetDeviceSequence("reverse", device1)
+				must(t, err)
+				if seq != 2 || !m.ConnectedTo(device1) {
+					t.Fatalf("new folder requires reconnection: sequence=%d", seq)
+				}
+			} else if !errors.Is(err, ErrFolderMissing) {
+				t.Fatalf("stale/withdrawn share restored: %v", err)
+			}
+			after, _ := current.indexHandlers.Get("default")
+			seq, err := m.sdb.GetDeviceSequence("default", device1)
+			must(t, err)
+			if after != existing || seq != 1 {
+				t.Fatalf("sibling index reset on replay: sequence=%d", seq)
+			}
+		})
+	}
+}
+
+type replayIndexDB struct {
+	db.DB
+	entered, release chan struct{}
+	once             sync.Once
+}
+
+func (d *replayIndexDB) GetIndexID(folder string, device protocol.DeviceID) (protocol.IndexID, error) {
+	if device == protocol.LocalDeviceID {
+		d.once.Do(func() { close(d.entered); <-d.release })
+	}
+	return d.DB.GetIndexID(folder, device)
+}
+
+func TestDeferredClusterConfigDrainsBeforeConnectionReplacement(t *testing.T) {
+	for _, action := range []string{"close", "replace-primary"} {
+		t.Run(action, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				cfg, _ := newDefaultCfgWrapper(t)
+				// This fake-filesystem test owns all its workers; avoid the
+				// process-global case-cache cleaner inside the time bubble.
+				w, err := cfg.Modify(func(c *config.Configuration) { c.Folders[0].CaseSensitiveFS = true })
+				must(t, err)
+				w.Wait()
+				gate := new(FolderAccess)
+				m := setupModel(t, cfg, gate)
+				defer cleanupModel(m)
+				old := newFakeConnection(device1, m)
+				m.AddConnection(old, protocol.Hello{})
+				cc := func(id protocol.IndexID) *protocol.ClusterConfig {
+					return &protocol.ClusterConfig{Folders: []protocol.Folder{{ID: "default", Devices: []protocol.Device{{ID: myID}, {ID: device1, IndexID: id}}}}}
+				}
+				gate.Seal(device1, "default")
+				must(t, m.ClusterConfig(old, cc(101)))
+				registry := m.ensureIndexHandler(old)
+				barrier := &replayIndexDB{DB: registry.sdb, entered: make(chan struct{}), release: make(chan struct{})}
+				registry.sdb = barrier
+				// Open without scheduling a second replay in the model loop.
+				gate.mu.Lock()
+				delete(gate.sealed, folderScope{device1, "default"})
+				gate.mu.Unlock()
+				replayed := make(chan struct{})
+				go func() { m.retryPendingClusterConfigs(); close(replayed) }()
+				<-barrier.entered // Identity was checked; shared DB mutation is next.
+				defer func() {
+					select {
+					case <-barrier.release:
+					default:
+						close(barrier.release)
+					}
+					<-replayed
+				}()
+				changed := make(chan error, 1)
+				fresh := newFakeConnection(device1, m)
+				if action == "close" {
+					go func() { old.Close(errors.New("close during replay")); changed <- nil }()
+				} else {
+					m.AddConnection(fresh, protocol.Hello{})
+					go func() { changed <- m.ClusterConfig(fresh, cc(202)) }()
+				}
+				synctest.Wait()
+				select {
+				case err := <-changed:
+					t.Fatalf("connection lifecycle passed an unfinished replay: %v", err)
+				default:
+				}
+				close(barrier.release)
+				<-replayed
+				must(t, <-changed)
+				if action == "close" {
+					m.AddConnection(fresh, protocol.Hello{})
+					must(t, m.ClusterConfig(fresh, cc(202)))
+				}
+				must(t, m.Index(fresh, &protocol.Index{Folder: "default", Files: []protocol.FileInfo{{Name: "new", Deleted: true, Sequence: 1, Version: protocol.Vector{}.Update(device1.Short())}}}))
+				m.retryPendingClusterConfigs()
+				id, err := m.sdb.GetIndexID("default", device1)
+				must(t, err)
+				seq, err := m.sdb.GetDeviceSequence("default", device1)
+				must(t, err)
+				if id != 202 || seq != 1 {
+					t.Fatalf("old replay damaged replacement index: id=%d sequence=%d", id, seq)
+				}
+			})
+		})
+	}
+}
+
 func TestIntroducerWithheldFolderIsolationAndRecovery(t *testing.T) {
 	for _, pause := range []bool{false, true} {
 		t.Run(fmt.Sprintf("pause=%v", pause), func(t *testing.T) {
@@ -4652,4 +4850,141 @@ func TestWithheldTemporaryIndexRetentionAndRecovery(t *testing.T) {
 	check("A")
 	apply()
 	check()
+}
+
+func TestAsymmetricIndexWaitLifecycle(t *testing.T) {
+	for _, action := range []string{"announce", "pending-replay", "withdraw", "remote-pause", "revoke", "close-incoming", "close-other", "timeout", "unregistered", "same-connection"} {
+		for _, initial := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/initial=%v", action, initial), func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					cfg, _ := newDefaultCfgWrapper(t)
+					w, err := cfg.Modify(func(c *config.Configuration) {
+						c.Folders[0].CaseSensitiveFS = true
+						f := newFolderConfig()
+						f.ID = "reverse"
+						f.CaseSensitiveFS = true
+						c.SetFolder(f)
+					})
+					must(t, err)
+					w.Wait()
+					gate := new(FolderAccess)
+					m := setupModel(t, cfg, gate)
+					defer cleanupModel(m)
+					incoming, outgoing := newFakeConnection(device1, m), newFakeConnection(device1, m)
+					m.AddConnection(incoming, protocol.Hello{})
+					m.AddConnection(outgoing, protocol.Hello{})
+					cc := func(reverse bool, paused bool) *protocol.ClusterConfig {
+						folders := []protocol.Folder{{ID: "default", Devices: []protocol.Device{{ID: myID}, {ID: device1, IndexID: 11}}}}
+						if reverse {
+							f := protocol.Folder{ID: "reverse", Devices: []protocol.Device{{ID: myID}, {ID: device1, IndexID: 22}}}
+							if paused {
+								f.StopReason = protocol.FolderStopReasonPaused
+							}
+							folders = append(folders, f)
+						}
+						return &protocol.ClusterConfig{Folders: folders}
+					}
+					must(t, m.ClusterConfig(incoming, &protocol.ClusterConfig{Secondary: true}))
+					if !initial {
+						must(t, m.ClusterConfig(outgoing, cc(false, false)))
+					}
+					if action == "pending-replay" {
+						gate.Seal(device1, "default")
+						must(t, m.ClusterConfig(outgoing, cc(false, false)))
+					}
+					conn := protocol.Connection(incoming)
+					if action == "unregistered" {
+						conn = newFakeConnection(device1, m)
+					}
+					if action == "same-connection" {
+						must(t, m.ClusterConfig(incoming, cc(false, false)))
+					}
+					done := make(chan error, 1)
+					go func() {
+						done <- m.Index(conn, &protocol.Index{Folder: "reverse", Files: []protocol.FileInfo{{Name: "first", Deleted: true, Sequence: 1, Version: protocol.Vector{}.Update(device1.Short())}}, LastSequence: 1})
+					}()
+					synctest.Wait()
+					if action == "unregistered" || action == "same-connection" {
+						select {
+						case err := <-done:
+							if err == nil {
+								t.Fatal("invalid index accepted")
+							}
+						default:
+							t.Fatal("waited for own dispatcher or unregistered connection")
+						}
+						return
+					}
+					select {
+					case err := <-done:
+						t.Fatalf("did not wait for other dispatcher: %v", err)
+					default:
+					}
+					// A third connection's Secondary is not a complete snapshot
+					// and must neither release nor abort this negotiation wait.
+					third := newFakeConnection(device1, m)
+					m.AddConnection(third, protocol.Hello{})
+					must(t, m.ClusterConfig(third, &protocol.ClusterConfig{Secondary: true}))
+					synctest.Wait()
+					select {
+					case err := <-done:
+						t.Fatalf("Secondary ended negotiation: %v", err)
+					default:
+					}
+					switch action {
+					case "announce":
+						must(t, m.ClusterConfig(outgoing, cc(true, false)))
+					case "pending-replay":
+						must(t, gate.Open(device1, "default"))
+						m.retryPendingClusterConfigs()
+						synctest.Wait()
+						select {
+						case err := <-done:
+							t.Fatalf("old sibling announcement replay ended new-folder wait: %v", err)
+						default:
+						}
+						must(t, m.ClusterConfig(outgoing, cc(true, false)))
+					case "withdraw":
+						must(t, m.ClusterConfig(outgoing, cc(false, false)))
+					case "remote-pause":
+						must(t, m.ClusterConfig(outgoing, cc(true, true)))
+					case "revoke":
+						gate.Seal(device1, "reverse")
+					case "close-incoming":
+						incoming.Close(io.EOF)
+					case "close-other":
+						outgoing.Close(io.EOF)
+					}
+					err = <-done // timeout case advances only the existing receive-timeout clock
+					switch action {
+					case "announce", "pending-replay":
+						must(t, err)
+						seq, e := m.sdb.GetDeviceSequence("reverse", device1)
+						must(t, e)
+						if seq != 1 {
+							t.Fatal(seq)
+						}
+					case "revoke":
+						must(t, err)
+						must(t, gate.Drain(context.Background(), device1, "reverse"))
+						must(t, gate.Open(device1, "reverse"))
+						must(t, m.ClusterConfig(outgoing, cc(true, false)))
+						seq, e := m.sdb.GetDeviceSequence("reverse", device1)
+						must(t, e)
+						if seq != 0 {
+							t.Fatal("revoked index crossed reopen", seq)
+						}
+					case "timeout":
+						if !errors.Is(err, context.DeadlineExceeded) {
+							t.Fatal(err)
+						}
+					default:
+						if err == nil {
+							t.Fatal("withdrawn/closed negotiation accepted index")
+						}
+					}
+				})
+			})
+		}
+	}
 }

@@ -14,10 +14,13 @@ import (
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/protocol"
 	relayprotocol "github.com/syncthing/syncthing/lib/relay/protocol"
+	"github.com/syncthing/syncthing/lib/semaphore"
+	"github.com/syncthing/syncthing/lib/stats"
 	"net/url"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -37,12 +40,12 @@ func TestPrivateLookupDoesNotPersistOrReplaceDirect(t *testing.T) {
 	s.options.Lookup = func(context.Context, protocol.DeviceID) ([]string, error) {
 		return []string{"quic://192.0.2.2:22000"}, nil
 	}
-	addrs := s.resolveDeviceAddrs(context.Background(), cfg)
-	if len(addrs) != 2 || addrs[0] != cfg.Addresses[0] || len(cfg.Addresses) != 1 {
+	addrs, pending := s.resolveDeviceAddrs(context.Background(), cfg)
+	if pending || len(addrs) != 2 || addrs[0] != cfg.Addresses[0] || len(cfg.Addresses) != 1 {
 		t.Fatal(addrs, cfg.Addresses)
 	}
 	s.options.Lookup = func(context.Context, protocol.DeviceID) ([]string, error) { return nil, errors.New("revoked") }
-	if addrs = s.resolveDeviceAddrs(context.Background(), cfg); len(addrs) != 1 || addrs[0] != cfg.Addresses[0] {
+	if addrs, pending = s.resolveDeviceAddrs(context.Background(), cfg); !pending || len(addrs) != 1 || addrs[0] != cfg.Addresses[0] {
 		t.Fatal(addrs)
 	}
 }
@@ -580,4 +583,415 @@ func TestWANPolicySnapshotControlsConnectionTarget(t *testing.T) {
 			t.Fatal("target selection refunded an unreleased resource")
 		}
 	}
+}
+
+// This model has no filesystem or network work; tests run the real connection
+// scheduler with fake time and stop at the admission boundary.
+type dialLoopModel struct{ Model }
+
+func (dialLoopModel) DeviceStatistics() (map[protocol.DeviceID]stats.DeviceStatistics, error) {
+	return nil, nil
+}
+
+func TestPrivateLookupArrivingAfterResumeDoesNotWaitForMinuteLoop(t *testing.T) {
+	for _, mode := range []string{"new", "resume", "vpn-recovery"} {
+		t.Run(mode, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				peer := protocol.NewDeviceID([]byte("peer"))
+				cfg := config.Configuration{}
+				if mode != "new" {
+					cfg.Devices = []config.DeviceConfiguration{{DeviceID: peer, Paused: true}}
+				}
+				wrapped := config.Wrap("", cfg, protocol.LocalDeviceID, events.NoopLogger)
+				ctx, cancel := context.WithCancel(context.Background())
+				configDone := make(chan struct{})
+				go func() { defer close(configDone); _ = wrapped.Serve(ctx) }()
+				var ready atomic.Bool
+				var lookups, attempts atomic.Int32
+				s := &service{cfg: wrapped, myID: protocol.LocalDeviceID, model: dialLoopModel{}, dialNow: make(chan struct{}, 1), dialNowDevices: make(map[protocol.DeviceID]struct{}), connectionStatusHandler: newConnectionStatusHandler(), lanChecker: &lanChecker{cfg: wrapped}}
+				s.options.Lookup = func(context.Context, protocol.DeviceID) ([]string, error) {
+					lookups.Add(1)
+					if !ready.Load() {
+						if mode == "vpn-recovery" {
+							return nil, errors.New("candidate snapshot not ready")
+						}
+						return nil, nil
+					}
+					return []string{"private-relay://127.0.0.1:22067"}, nil
+				}
+				s.options.BeforeDial = func(context.Context, protocol.DeviceID, string, bool) (context.Context, func(), error) {
+					attempts.Add(1)
+					return nil, nil, errors.New("test admission rejection")
+				}
+				done := make(chan struct{})
+				go func() { defer close(done); _ = s.connect(ctx) }()
+				defer func() { cancel(); <-done; <-configDone }()
+				// End initial ramp-up before adding/resuming the device, as in the WAN run.
+				time.Sleep(300 * time.Second)
+				synctest.Wait()
+				from := wrapped.RawCopy()
+				waiter, err := wrapped.Modify(func(c *config.Configuration) { c.Devices = []config.DeviceConfiguration{{DeviceID: peer}} })
+				if err != nil {
+					t.Fatal(err)
+				}
+				waiter.Wait()
+				s.checkAndSignalConnectLoopOnUpdatedDevices(from, wrapped.RawCopy())
+				synctest.Wait()
+				if lookups.Load() != 1 || attempts.Load() != 0 {
+					t.Fatal(lookups.Load(), attempts.Load())
+				}
+				ready.Store(true)
+				time.Sleep(minConnectionLoopSleep)
+				synctest.Wait()
+				if attempts.Load() != 1 {
+					t.Fatalf("new hints stranded: lookups=%d attempts=%d", lookups.Load(), attempts.Load())
+				}
+				// Hints do not grant admission or shorten the failed address's 30s backoff.
+				time.Sleep(minConnectionLoopSleep)
+				synctest.Wait()
+				if attempts.Load() != 1 {
+					t.Fatal("address cooldown bypassed", attempts.Load())
+				}
+			})
+		})
+	}
+}
+
+func TestDialTimeIsNotAddedToReconnectDelay(t *testing.T) {
+	for _, latency := range []time.Duration{10 * time.Second, 35 * time.Second} {
+		t.Run(latency.String(), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				peer := protocol.NewDeviceID([]byte("peer"))
+				wrapped := config.Wrap("", config.Configuration{}, protocol.LocalDeviceID, events.NoopLogger)
+				ctx, cancel := context.WithCancel(context.Background())
+				configDone := make(chan struct{})
+				go func() { defer close(configDone); _ = wrapped.Serve(ctx) }()
+				s := &service{cfg: wrapped, myID: protocol.LocalDeviceID, model: dialLoopModel{}, dialNow: make(chan struct{}, 1), dialNowDevices: make(map[protocol.DeviceID]struct{}), connectionStatusHandler: newConnectionStatusHandler(), lanChecker: &lanChecker{cfg: wrapped}}
+				s.options.Lookup = func(context.Context, protocol.DeviceID) ([]string, error) {
+					return []string{"private-relay://127.0.0.1:22067"}, nil
+				}
+				var mu sync.Mutex
+				var attempts []time.Time
+				s.options.BeforeDial = func(ctx context.Context, _ protocol.DeviceID, _ string, _ bool) (context.Context, func(), error) {
+					mu.Lock()
+					attempts = append(attempts, time.Now())
+					first := len(attempts) == 1
+					mu.Unlock()
+					if first {
+						select {
+						case <-time.After(latency):
+						case <-ctx.Done():
+						}
+					}
+					return nil, nil, errors.New("test admission rejection")
+				}
+				done := make(chan struct{})
+				go func() { defer close(done); _ = s.connect(ctx) }()
+				defer func() { cancel(); <-done; <-configDone }()
+				time.Sleep(300 * time.Second)
+				synctest.Wait()
+				from := wrapped.RawCopy()
+				waiter, err := wrapped.Modify(func(c *config.Configuration) {
+					c.Devices = []config.DeviceConfiguration{{DeviceID: peer, Addresses: []string{"dynamic"}}}
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				waiter.Wait()
+				s.checkAndSignalConnectLoopOnUpdatedDevices(from, wrapped.RawCopy())
+				synctest.Wait()
+				expected := 30 * time.Second
+				if latency >= expected {
+					expected = latency + minConnectionLoopSleep
+				}
+				time.Sleep(expected)
+				synctest.Wait()
+				mu.Lock()
+				defer mu.Unlock()
+				if len(attempts) != 2 || attempts[1].Sub(attempts[0]) != expected {
+					t.Fatalf("dial time added to backoff: %v", attempts)
+				}
+			})
+		})
+	}
+}
+
+func TestDisconnectedPrivateRelayStartsWithWANAttempt(t *testing.T) {
+	for _, private := range []bool{false, true} {
+		name := "legacy remains serial"
+		if private {
+			name = "private relay does not wait for WAN timeout"
+		}
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				cfg := config.Wrap("", config.Configuration{Options: config.OptionsConfiguration{AlwaysLocalNets: []string{"10.20.30.0/24"}}}, protocol.LocalDeviceID, events.NoopLogger)
+				s := &service{lanChecker: &lanChecker{cfg: cfg}, connectionStatusHandler: newConnectionStatusHandler()}
+				if private {
+					s.options.Lookup = func(context.Context, protocol.DeviceID) ([]string, error) { return nil, nil }
+					s.options.SingleWANConnection = func() bool { return true }
+				}
+				attempts := make(chan string, 3)
+				releaseLAN, releaseWAN := make(chan struct{}), make(chan struct{})
+				s.options.BeforeDial = func(ctx context.Context, _ protocol.DeviceID, addr string, _ bool) (context.Context, func(), error) {
+					attempts <- addr
+					switch addr {
+					case "tcp://10.20.30.1:22000":
+						<-releaseLAN
+					case "tcp://192.0.2.1:22000":
+						<-releaseWAN
+					}
+					return nil, nil, errors.New("test dial failure")
+				}
+				target := func(addr string, priority int) dialTarget {
+					u, err := url.Parse(addr)
+					if err != nil {
+						t.Fatal(err)
+					}
+					return dialTarget{addr: addr, uri: u, priority: priority}
+				}
+				targets := []dialTarget{target("tcp://10.20.30.1:22000", 10), target("tcp://192.0.2.1:22000", 30), target("private-relay://192.0.2.2:22067", 50)}
+				done := make(chan struct{})
+				go func() {
+					defer close(done)
+					s.dialParallel(context.Background(), protocol.LocalDeviceID, targets, semaphore.New(8))
+				}()
+				synctest.Wait()
+				if len(attempts) != 1 || <-attempts != targets[0].addr {
+					t.Error("LAN must get its original first attempt")
+				}
+				close(releaseLAN)
+				synctest.Wait()
+				want := 1
+				if private {
+					want = 2
+				}
+				if len(attempts) != want {
+					t.Errorf("got %d WAN attempts before direct completed, want %d", len(attempts), want)
+				}
+				close(releaseWAN)
+				<-done
+				if targets[2].priority != 50 {
+					t.Error("relay connection priority changed")
+				}
+			})
+		})
+	}
+}
+
+func TestHintChangeCancelsOnlyObservedAttempt(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		a, b := make(chan struct{}), make(chan struct{})
+		ctx, stop := cancelOnHintsChanged(context.Background(), a)
+		defer stop()
+		other, stopOther := cancelOnHintsChanged(context.Background(), b)
+		defer stopOther()
+		done := make(chan struct{})
+		go func() { <-ctx.Done(); close(done) }()
+		synctest.Wait()
+		close(a)
+		synctest.Wait()
+		select {
+		case <-done:
+		default:
+			t.Fatal("blocked dial not interrupted")
+		}
+		if other.Err() != nil {
+			t.Fatal("unrelated peer canceled")
+		}
+	})
+}
+
+func TestHintWatcherStopAndAlreadyPublished(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		changed := make(chan struct{})
+		close(changed)
+		ctx, stop := cancelOnHintsChanged(context.Background(), changed)
+		synctest.Wait()
+		if ctx.Err() == nil {
+			t.Fatal("publication between subscribe and dial lost")
+		}
+		stop()
+		ctx, stop = cancelOnHintsChanged(context.Background(), make(chan struct{}))
+		stop()
+		if ctx.Err() == nil {
+			t.Fatal("attempt context retained")
+		}
+	})
+}
+
+func TestHintUpdateWakesSleepingAndActiveDialLoop(t *testing.T) {
+	for _, active := range []bool{false, true} {
+		t.Run(fmt.Sprint(active), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				peer := protocol.NewDeviceID([]byte("peer"))
+				other := protocol.NewDeviceID([]byte("other"))
+				otherChanged := make(chan struct{})
+				var otherCanceled atomic.Bool
+				wrapped := config.Wrap("", config.Configuration{}, protocol.LocalDeviceID, events.NoopLogger)
+				ctx, cancel := context.WithCancel(context.Background())
+				configDone := make(chan struct{})
+				go func() { defer close(configDone); _ = wrapped.Serve(ctx) }()
+				s := &service{cfg: wrapped, myID: protocol.LocalDeviceID, model: dialLoopModel{}, dialNow: make(chan struct{}, 1), dialNowDevices: make(map[protocol.DeviceID]struct{}), connectionStatusHandler: newConnectionStatusHandler(), lanChecker: &lanChecker{cfg: wrapped}}
+				changed, next := make(chan struct{}), make(chan struct{})
+				var published atomic.Bool
+				var oldCalls, newCalls atomic.Int32
+				s.options.LookupChanged = func(id protocol.DeviceID) <-chan struct{} {
+					if id == other {
+						return otherChanged
+					}
+					if published.Load() {
+						return next
+					}
+					return changed
+				}
+				s.options.Lookup = func(_ context.Context, id protocol.DeviceID) ([]string, error) {
+					if id == other {
+						return []string{"tcp://192.0.2.3:22000"}, nil
+					}
+					out := []string{"tcp://192.0.2.1:22000"}
+					if published.Load() {
+						out = append(out, "private-relay://192.0.2.2:22067")
+					}
+					return out, nil
+				}
+				s.options.BeforeDial = func(ctx context.Context, _ protocol.DeviceID, addr string, _ bool) (context.Context, func(), error) {
+					if addr == "tcp://192.0.2.3:22000" {
+						<-ctx.Done()
+						otherCanceled.Store(true)
+						return nil, nil, ctx.Err()
+					}
+					if addr == "tcp://192.0.2.1:22000" {
+						oldCalls.Add(1)
+						if active {
+							<-ctx.Done()
+						}
+					} else {
+						newCalls.Add(1)
+					}
+					return nil, nil, errors.New("test admission rejected")
+				}
+				done := make(chan struct{})
+				go func() { defer close(done); _ = s.connect(ctx) }()
+				defer func() { cancel(); <-done; <-configDone }()
+				time.Sleep(300 * time.Second)
+				synctest.Wait()
+				from := wrapped.RawCopy()
+				w, err := wrapped.Modify(func(c *config.Configuration) {
+					c.Devices = []config.DeviceConfiguration{{DeviceID: peer}, {DeviceID: other}}
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				w.Wait()
+				s.checkAndSignalConnectLoopOnUpdatedDevices(from, wrapped.RawCopy())
+				synctest.Wait()
+				if oldCalls.Load() != 1 {
+					t.Fatal(oldCalls.Load())
+				}
+				published.Store(true)
+				close(changed)
+				synctest.Wait()
+				if otherCanceled.Load() {
+					t.Fatal("other peer canceled")
+				}
+				if newCalls.Load() != 1 {
+					t.Fatal("new candidate remained blocked", newCalls.Load())
+				}
+				if oldCalls.Load() != 1 {
+					t.Fatal("candidate wake bypassed old address backoff", oldCalls.Load())
+				}
+			})
+		})
+	}
+}
+
+func TestSequentialPeerHintUpdatesDoNotReopenIdleBatch(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		a, b := protocol.NewDeviceID([]byte("a")), protocol.NewDeviceID([]byte("b"))
+		wrapped := config.Wrap("", config.Configuration{}, protocol.LocalDeviceID, events.NoopLogger)
+		ctx, cancel := context.WithCancel(context.Background())
+		configDone := make(chan struct{})
+		go func() { defer close(configDone); _ = wrapped.Serve(ctx) }()
+		s := &service{cfg: wrapped, myID: protocol.LocalDeviceID, model: dialLoopModel{}, dialNow: make(chan struct{}, 1), dialNowDevices: make(map[protocol.DeviceID]struct{}), connectionStatusHandler: newConnectionStatusHandler(), lanChecker: &lanChecker{cfg: wrapped}}
+		ca, cb, ga, gb, never := make(chan struct{}), make(chan struct{}), make(chan struct{}), make(chan struct{}), make(chan struct{})
+		var phase atomic.Int32
+		var aNew, bNew atomic.Int32
+		var aCanceled atomic.Bool
+		s.options.LookupChanged = func(id protocol.DeviceID) <-chan struct{} {
+			p := phase.Load()
+			if id == a {
+				if p == 0 {
+					return ca
+				}
+				return never
+			}
+			if id == b {
+				if p < 2 {
+					return cb
+				}
+				return never
+			}
+			if p == 0 {
+				return ga
+			}
+			if p == 1 {
+				return gb
+			}
+			return never
+		}
+		s.options.Lookup = func(_ context.Context, id protocol.DeviceID) ([]string, error) {
+			if id == a {
+				v := []string{"tcp://192.0.2.1:22000"}
+				if phase.Load() > 0 {
+					v = append(v, "tcp://192.0.2.11:22000")
+				}
+				return v, nil
+			}
+			v := []string{"tcp://192.0.2.2:22000"}
+			if phase.Load() > 1 {
+				v = append(v, "tcp://192.0.2.12:22000")
+			}
+			return v, nil
+		}
+		s.options.BeforeDial = func(ctx context.Context, _ protocol.DeviceID, addr string, _ bool) (context.Context, func(), error) {
+			switch addr {
+			case "tcp://192.0.2.1:22000":
+				<-ctx.Done()
+			case "tcp://192.0.2.11:22000":
+				aNew.Add(1)
+				<-ctx.Done()
+				aCanceled.Store(true)
+			case "tcp://192.0.2.12:22000":
+				bNew.Add(1)
+			}
+			return nil, nil, errors.New("injected rejection")
+		}
+		done := make(chan struct{})
+		go func() { defer close(done); _ = s.connect(ctx) }()
+		defer func() { cancel(); <-done; <-configDone }()
+		time.Sleep(300 * time.Second)
+		synctest.Wait()
+		from := wrapped.RawCopy()
+		w, err := wrapped.Modify(func(c *config.Configuration) { c.Devices = []config.DeviceConfiguration{{DeviceID: a}, {DeviceID: b}} })
+		if err != nil {
+			t.Fatal(err)
+		}
+		w.Wait()
+		s.checkAndSignalConnectLoopOnUpdatedDevices(from, wrapped.RawCopy())
+		synctest.Wait()
+		phase.Store(1)
+		close(ca)
+		close(ga)
+		synctest.Wait()
+		if aNew.Load() != 1 {
+			t.Fatal("A not redialed", aNew.Load())
+		}
+		phase.Store(2)
+		close(cb)
+		close(gb)
+		synctest.Wait()
+		if bNew.Load() != 1 || aCanceled.Load() {
+			t.Fatal("B stranded behind restarted A", bNew.Load(), aCanceled.Load())
+		}
+	})
 }

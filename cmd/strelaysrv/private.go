@@ -16,7 +16,9 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/netip"
 	"strings"
@@ -33,6 +35,14 @@ type privateRelayConfig struct {
 	KeyNotAfter map[string]int64  `json:"key_not_after,omitempty"`
 	Keys        map[string][]byte `json:"keys"`
 }
+
+var (
+	errJoinPermit               = fmt.Errorf("permit_invalid: %w", protocol.ErrPermit)
+	errJoinDeviceCapacity       = fmt.Errorf("device_capacity: %w", protocol.ErrPermit)
+	errJoinRegistrationActive   = fmt.Errorf("registration_active: %w", protocol.ErrPermit)
+	errJoinRegistrationCapacity = fmt.Errorf("registration_capacity: %w", protocol.ErrPermit)
+)
+
 type privateDevice struct {
 	limiter *rate.Limiter
 	retain  int64
@@ -64,6 +74,7 @@ type privateRelay struct {
 	now                    func() time.Time
 	handshakes             chan struct{}
 	admission              *rate.Limiter
+	joinDiagnostics        *rate.Limiter
 }
 
 func newPrivateRelay(config privateRelayConfig, id native.DeviceID) (*privateRelay, error) {
@@ -100,7 +111,7 @@ func newPrivateRelay(config privateRelayConfig, id native.DeviceID) (*privateRel
 	if _, e := rand.Read(b); e != nil {
 		return nil, e
 	}
-	return &privateRelay{issuer: config.Issuer, audience: id.String(), boot: hex.EncodeToString(b), keys: keys, keyNotAfter: expiry, registrations: map[native.DeviceID]*privateRegistration{}, devices: map[native.DeviceID]*privateDevice{}, sources: map[string]*privateDevice{}, allocations: map[string]*privateAllocation{}, counts: map[native.DeviceID]int{}, now: time.Now, handshakes: make(chan struct{}, 512), admission: rate.NewLimiter(200, 512)}, nil
+	return &privateRelay{issuer: config.Issuer, audience: id.String(), boot: hex.EncodeToString(b), keys: keys, keyNotAfter: expiry, registrations: map[native.DeviceID]*privateRegistration{}, devices: map[native.DeviceID]*privateDevice{}, sources: map[string]*privateDevice{}, allocations: map[string]*privateAllocation{}, counts: map[native.DeviceID]int{}, now: time.Now, handshakes: make(chan struct{}, 512), admission: rate.NewLimiter(200, 512), joinDiagnostics: rate.NewLimiter(1, 4)}, nil
 }
 
 func (p *privateRelay) verify(token protocol.PermitToken, id native.DeviceID, use string) (protocol.Permit, error) {
@@ -135,7 +146,7 @@ func (p *privateRelay) verify(token protocol.PermitToken, id native.DeviceID, us
 func (p *privateRelay) register(id native.DeviceID, token protocol.PermitToken, out chan any) (time.Time, error) {
 	grant, e := p.verify(token, id, "join")
 	if e != nil {
-		return time.Time{}, protocol.ErrPermit
+		return time.Time{}, errJoinPermit
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -147,15 +158,15 @@ func (p *privateRelay) register(id native.DeviceID, token protocol.PermitToken, 
 	}
 	d := p.devices[id]
 	if d == nil && len(p.devices) >= 4096 {
-		return time.Time{}, protocol.ErrPermit
+		return time.Time{}, errJoinDeviceCapacity
 	}
 	if old := p.registrations[id]; old != nil {
 		if old.out != out {
-			return time.Time{}, protocol.ErrPermit
+			return time.Time{}, errJoinRegistrationActive
 		}
 	} else {
 		if len(p.registrations) >= 1024 {
-			return time.Time{}, protocol.ErrPermit
+			return time.Time{}, errJoinRegistrationCapacity
 		}
 		if d == nil {
 			d = &privateDevice{limiter: rate.NewLimiter(2, 4)}
@@ -310,6 +321,11 @@ func (p *privateRelay) handle(tcp net.Conn, config *tls.Config, releaseHandshake
 			case protocol.PrivateJoinRequest:
 				until, e := p.register(id, q.Permit, out)
 				if e != nil {
+					// Internal reasons are static. Do not log the permit, remote
+					// identity or address, or distinguish rejection on the wire.
+					if p.joinDiagnostics.Allow() {
+						log.Printf("Private relay join rejected: %v", e)
+					}
 					deny()
 					return
 				}
