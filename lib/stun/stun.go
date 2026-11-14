@@ -89,7 +89,10 @@ func New(cfg config.Wrapper, subscriber Subscriber, conn net.PacketConn) *Servic
 // SetServerPolicy installs an embedding application's run-local STUN policy.
 // It must be called before Serve. Nil preserves standalone configuration; a
 // non-nil callback returns only explicit endpoints, with no public fallback.
-// An empty list disables STUN independently of router port mapping.
+// An empty list disables STUN independently of router port mapping. Explicit
+// policies use Binding-only mapping discovery; reachability is established by
+// authenticated QUIC dialing, not by a NAT classification. The supplied packet
+// connection must interrupt reads/writes when the Serve context is canceled.
 func (s *Service) SetServerPolicy(policy func() []string) { s.policy = policy }
 
 func (s *Service) disabled() bool {
@@ -207,6 +210,10 @@ func (s *Service) runStunForServer(ctx context.Context, addr string) error {
 	}
 	s.client.SetServerAddr(udpAddr.String())
 
+	if s.policy != nil {
+		return s.runMappingForServer(ctx, addr)
+	}
+
 	var natType stun.NATType
 	var extAddr *stun.Host
 	err = svcutil.CallWithContext(ctx, func() error {
@@ -241,6 +248,42 @@ func (s *Service) runStunForServer(ctx context.Context, addr string) error {
 	return s.stunKeepAlive(ctx, addr, extAddr)
 }
 
+// runMappingForServer is used only by explicit embedding policies. Keepalive
+// performs an ordinary Binding transaction on the listener's UDP socket; it
+// does not require CHANGE-REQUEST or a second STUN server address.
+func (s *Service) runMappingForServer(ctx context.Context, addr string) error {
+	defer s.setExternalAddress(nil, "")
+	s.setNATType(NATUnknown)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	extAddr, err := s.client.Keepalive()
+	if err != nil {
+		return err
+	}
+	return s.stunKeepAlive(ctx, addr, extAddr)
+}
+
+func (s *Service) validateMapping(ctx context.Context, server string, address *Host) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !s.serverAllowed(server) {
+		return errServerRevoked
+	}
+	if s.disabled() {
+		return errors.New("STUN disabled")
+	}
+	if address == nil {
+		return errors.New("STUN Binding returned no mapped address")
+	}
+	ip := net.ParseIP(address.IP())
+	if ip == nil || ip.IsUnspecified() || ip.IsMulticast() || address.Port() == 0 {
+		return errors.New("STUN Binding returned invalid mapped address")
+	}
+	return nil
+}
+
 func (s *Service) stunKeepAlive(ctx context.Context, addr string, extAddr *Host) error {
 	var err error
 	nextSleep := time.Duration(s.cfg.Options().StunKeepaliveStartS) * time.Second
@@ -249,6 +292,11 @@ func (s *Service) stunKeepAlive(ctx context.Context, addr string, extAddr *Host)
 
 	var ourLastWrite time.Time
 	for {
+		if s.policy != nil {
+			if err := s.validateMapping(ctx, addr, extAddr); err != nil {
+				return err
+			}
+		}
 		if areDifferent(s.addr, extAddr) {
 			// If the port has changed (addresses are not equal but the hosts are equal),
 			// we're probably spending too much time between keepalives, reduce the sleep.

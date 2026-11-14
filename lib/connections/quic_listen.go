@@ -105,9 +105,9 @@ func (t *quicListener) serve(ctx context.Context) error {
 	quicTransport := &quic.Transport{Conn: udpConn}
 	defer quicTransport.Close()
 
-	svc := stun.New(t.cfg, t, &transportPacketConn{tran: quicTransport})
-	svc.SetServerPolicy(t.lanChecker.stunServers)
 	stunCtx, cancel := context.WithCancel(ctx)
+	svc := stun.New(t.cfg, t, &transportPacketConn{tran: quicTransport, ctx: stunCtx})
+	svc.SetServerPolicy(t.lanChecker.stunServers)
 	stunDone := make(chan struct{})
 	defer func() { cancel(); <-stunDone }()
 	go func() { defer close(stunDone); _ = svc.Serve(stunCtx) }()
@@ -115,7 +115,7 @@ func (t *quicListener) serve(ctx context.Context) error {
 	t.registry.Register(t.uri.Scheme, quicTransport)
 	defer t.registry.Unregister(t.uri.Scheme, quicTransport)
 
-	listener, err := quicTransport.Listen(t.tlsCfg, quicConfig)
+	listener, err := quicTransport.Listen(t.tlsCfg, quicConfigForRuntime(t.lanChecker))
 	if err != nil {
 		slog.WarnContext(ctx, "Failed to listen (QUIC)", slogutil.Error(err))
 		return err
