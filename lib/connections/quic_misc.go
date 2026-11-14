@@ -94,7 +94,7 @@ func transportConnUnspecified(conn any) bool {
 // A transportPacketConn is a net.PacketConn that uses a quic.Transport.
 type transportPacketConn struct {
 	tran         *quic.Transport
-	ctx          context.Context // STUN lifetime; never closes the shared QUIC transport
+	ctx          context.Context //nolint:containedctx // Listener-owned STUN lifetime: net.PacketConn methods cannot accept a context; cancellation must not close the shared QUIC transport.
 	readDeadline atomic.Value    // time.Time
 }
 
