@@ -69,7 +69,7 @@ func (d *quicDialer) Dial(ctx context.Context, _ protocol.DeviceID, uri *url.URL
 	ctx, cancel := context.WithTimeout(ctx, quicOperationTimeout)
 	defer cancel()
 
-	session, err := transport.Dial(ctx, addr, d.tlsCfg, quicConfig)
+	session, err := transport.Dial(ctx, addr, d.tlsCfg, quicConfigForRuntime(d.lanChecker))
 	if err != nil {
 		if createdConn != nil {
 			_ = createdConn.Close()

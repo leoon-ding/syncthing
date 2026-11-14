@@ -27,6 +27,21 @@ var quicConfig = &quic.Config{
 	KeepAlivePeriod: 15 * time.Second,
 }
 
+// quicConfigForRuntime keeps the private embedding path at QUIC's base packet
+// size, matching the embedding SCM transport. A successful isolated MTU probe
+// does not guarantee that sustained larger datagrams survive a tunneled path;
+// quic-go does not lower its discovered size after that data starts being lost.
+// Standalone hosts retain upstream probing. Never mutate the shared base config.
+func quicConfigForRuntime(checker *lanChecker) *quic.Config {
+	if checker == nil || checker.privateConnect == nil {
+		return quicConfig
+	}
+	cfg := quicConfig.Clone()
+	cfg.InitialPacketSize = 1200
+	cfg.DisablePathMTUDiscovery = true
+	return cfg
+}
+
 func quicNetwork(uri *url.URL) string {
 	switch uri.Scheme {
 	case "quic4":
@@ -79,11 +94,15 @@ func transportConnUnspecified(conn any) bool {
 // A transportPacketConn is a net.PacketConn that uses a quic.Transport.
 type transportPacketConn struct {
 	tran         *quic.Transport
-	readDeadline atomic.Value // time.Time
+	ctx          context.Context // STUN lifetime; never closes the shared QUIC transport
+	readDeadline atomic.Value    // time.Time
 }
 
 func (t *transportPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
-	ctx := context.Background()
+	ctx := t.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if deadline, ok := t.readDeadline.Load().(time.Time); ok && !deadline.IsZero() {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithDeadline(ctx, deadline)
@@ -93,6 +112,11 @@ func (t *transportPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err erro
 }
 
 func (t *transportPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+	if t.ctx != nil {
+		if err := t.ctx.Err(); err != nil {
+			return 0, err
+		}
+	}
 	return t.tran.WriteTo(p, addr)
 }
 
