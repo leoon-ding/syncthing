@@ -8,10 +8,12 @@ package stun
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/protocol"
+	"net"
 	"testing"
 	"time"
 )
@@ -137,5 +139,171 @@ func TestKeepaliveRejectsClearedPolicyAndAllowsRestore(t *testing.T) {
 	current = []string{endpoint}
 	if s.disabled() || !s.serverAllowed(endpoint) {
 		t.Fatal("restored endpoint rejected")
+	}
+}
+
+// bindingConn returns only XOR-MAPPED-ADDRESS, as a single-IP STUN server does.
+// No OTHER-ADDRESS or CHANGE-REQUEST support is available.
+type bindingConn struct {
+	request    []byte
+	writes     int
+	beforeRead func()
+	ctx        context.Context
+	entered    chan struct{}
+	invalid    bool
+}
+
+func (c *bindingConn) WriteTo(p []byte, _ net.Addr) (int, error) {
+	c.request = append([]byte(nil), p...)
+	c.writes++
+	return len(p), nil
+}
+func (c *bindingConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	if c.entered != nil {
+		close(c.entered)
+		<-c.ctx.Done()
+		return 0, nil, c.ctx.Err()
+	}
+	if c.beforeRead != nil {
+		c.beforeRead()
+	}
+	response := make([]byte, 32)
+	binary.BigEndian.PutUint16(response, 0x101)
+	binary.BigEndian.PutUint16(response[2:], 12)
+	copy(response[4:20], c.request[4:20])
+	binary.BigEndian.PutUint16(response[20:], 0x20)
+	binary.BigEndian.PutUint16(response[22:], 8)
+	response[25] = 1
+	port := uint16(40000 + c.writes)
+	if c.invalid {
+		port = 0
+	}
+	binary.BigEndian.PutUint16(response[26:], port^0x2112)
+	binary.BigEndian.PutUint32(response[28:], 0xcb007101^0x2112a442)
+	return copy(p, response), &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 3478}, nil
+}
+func (*bindingConn) Close() error { return nil }
+func (*bindingConn) LocalAddr() net.Addr {
+	return &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 22000}
+}
+func (*bindingConn) SetDeadline(time.Time) error      { return nil }
+func (*bindingConn) SetReadDeadline(time.Time) error  { return nil }
+func (*bindingConn) SetWriteDeadline(time.Time) error { return nil }
+
+type mappingSubscriber struct {
+	addresses []string
+	onAddress func()
+	types     []NATType
+}
+
+func (s *mappingSubscriber) OnNATTypeChanged(v NATType) { s.types = append(s.types, v) }
+func (s *mappingSubscriber) OnExternalAddressChanged(h *Host, _ string) {
+	if h == nil {
+		s.addresses = append(s.addresses, "")
+		return
+	}
+	s.addresses = append(s.addresses, h.TransportAddr())
+	if s.onAddress != nil {
+		s.onAddress()
+	}
+}
+func newMappingTestService(c *bindingConn, sub Subscriber) *Service {
+	cfg := config.Wrap("", config.Configuration{Options: config.OptionsConfiguration{StunKeepaliveMinS: 1, StunKeepaliveStartS: 2}}, protocol.LocalDeviceID, events.NoopLogger)
+	s := New(cfg, sub, c)
+	s.SetServerPolicy(func() []string { return []string{"127.0.0.1:3478"} })
+	return s
+}
+func TestMappingOnlyBindingAndRefresh(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c := &bindingConn{}
+	sub := &mappingSubscriber{}
+	sub.onAddress = func() {
+		if len(sub.addresses) == 2 {
+			cancel()
+		}
+	}
+	s := newMappingTestService(c, sub)
+	if err := s.runStunForServer(ctx, "127.0.0.1:3478"); !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	if len(sub.addresses) != 3 || sub.addresses[0] != "203.0.113.1:40001" || sub.addresses[1] != "203.0.113.1:40002" || sub.addresses[2] != "" {
+		t.Fatal(sub.addresses)
+	}
+	if c.writes != 2 || len(sub.types) != 0 || s.addr != nil {
+		t.Fatalf("writes=%d types=%v address=%v", c.writes, sub.types, s.addr)
+	}
+	for offset := 20; offset+4 <= len(c.request); {
+		typ := binary.BigEndian.Uint16(c.request[offset:])
+		size := int(binary.BigEndian.Uint16(c.request[offset+2:]))
+		if typ == 3 {
+			t.Fatal("sent CHANGE-REQUEST")
+		}
+		offset += 4 + (size+3)/4*4
+	}
+}
+func TestMappingRejectsLateOrInvalidResponse(t *testing.T) {
+	for _, mode := range []string{"cancel", "revoke", "replace", "disabled", "invalid"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			c := &bindingConn{}
+			sub := &mappingSubscriber{}
+			s := newMappingTestService(c, sub)
+			c.beforeRead = func() {
+				switch mode {
+				case "cancel":
+					cancel()
+				case "revoke":
+					s.SetServerPolicy(func() []string { return nil })
+				case "replace":
+					s.SetServerPolicy(func() []string { return []string{"127.0.0.1:3479"} })
+				case "disabled":
+					s.cfg = config.Wrap("", config.Configuration{}, protocol.LocalDeviceID, events.NoopLogger)
+				case "invalid":
+					c.invalid = true
+				}
+			}
+			if err := s.runStunForServer(ctx, "127.0.0.1:3478"); err == nil {
+				t.Fatal("accepted response")
+			}
+			if len(sub.addresses) != 0 || c.writes != 1 {
+				t.Fatalf("published=%v writes=%d", sub.addresses, c.writes)
+			}
+		})
+	}
+}
+func TestMappingCanceledReadDrainsBeforeReturn(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c := &bindingConn{ctx: ctx, entered: make(chan struct{})}
+	sub := &mappingSubscriber{}
+	s := newMappingTestService(c, sub)
+	done := make(chan error, 1)
+	go func() { done <- s.runStunForServer(ctx, "127.0.0.1:3478") }()
+	<-c.entered
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("read did not drain")
+	}
+	if c.writes != 1 || len(sub.addresses) != 0 {
+		t.Fatal("canceled binding published or retried")
+	}
+}
+func TestStandaloneStillRequiresNATDiscovery(t *testing.T) {
+	c := &bindingConn{}
+	sub := &mappingSubscriber{}
+	s := newMappingTestService(c, sub)
+	s.SetServerPolicy(nil)
+	if err := s.runStunForServer(context.Background(), "127.0.0.1:3478"); err == nil || err.Error() != "Server error: no changed address" {
+		t.Fatal(err)
+	}
+	if len(sub.addresses) != 0 {
+		t.Fatal(sub.addresses)
 	}
 }
